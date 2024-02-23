@@ -3,31 +3,16 @@ import os
 import time
 from pydantic import BaseModel
 from dataclasses import dataclass, field
+from typing import Union
 import asyncio
 import numpy as np
-import pandas as pd
 
-vol = modal.Volume.persisted("srma")
-cot_vol = modal.Volume.persisted("srma-cot")
-stub = modal.Stub(
-    "srma-retool",
-    image=modal.Image.debian_slim().pip_install(
-        ["google-generativeai", "pandas", "openai", "tiktoken"]
-    ),
-)
-stub.result_queue = modal.Queue.new()
-stub.cot_result_queue = modal.Queue.new()
-stub.status_tracker = modal.Dict.new()
-WORKSPACE = "jzsang"
-MOUNT_DIR = "/data"
-MOUNT_DIR_COT = "/cot"
-EXCLUDED_ABSTRACTS = "review_2821_irrelevant_csv_20240130175158.csv"
-INCLUDED_ABSTRACTS = "review_2821_included_csv_20240127132513.csv"
-IS_OPENAI = False
-ASSETS_PATH = os.path.join(os.path.dirname(__file__), "assets")
-TOKENIZER = "cl100k_base"
+# Constant texts
+FINAL_PROMPT = "{preprompt}\n{few_shot_text}\n# Abstract in investigation: \n{test_abstract}\n\n{prompt}\n"
+
+
+### LLM SETTINGS
 MAX_COMPLETION_TOKENS = 1536
-
 USAGE_LIMITS = {
     "gpt-3.5-turbo": {
         "max_requests_per_minute": 500,
@@ -46,33 +31,202 @@ USAGE_LIMITS = {
         "max_tokens_per_minute": float("inf"),
     },
 }
+TOKENIZER = "cl100k_base"
+TEXT_SEED = 1337
+
+### MODAL SETTINGS
+WORKSPACE = "jzsang"
+
+### Raw dataset storage
+vol = modal.Volume.persisted("srma")
+MOUNT_DIR = "/data"
+EXCLUDED_ABSTRACTS = "review_2821_irrelevant_csv_20240130175158.csv"
+INCLUDED_ABSTRACTS = "review_2821_included_csv_20240127132513.csv"
+
+### GPTCoT storage
+MOUNT_DIR_COT = "/cot"
+cot_vol = modal.Volume.persisted("srma-cot")
 
 
-def get_url(label):
-    return f"https://{WORKSPACE}--{label}-dev.modal.run"
+### MODAL INITIALIZERS
+stub = modal.Stub(
+    "srma-retool",
+    image=modal.Image.debian_slim().pip_install(
+        ["google-generativeai", "pandas", "openai", "tiktoken"]
+    ),
+)
+
+### Producer-Consumer Queues
+stub.result_queue = modal.Queue.new()
+stub.cot_result_queue = modal.Queue.new()
+
+### Process status tracker
+stub.status_tracker = modal.Dict.new()
+
+
+class GenerationTask:
+    excluded_abstracts = None
+    included_abstracts = None
+    gpt_cot = None
+
+    def __init__(
+        self,
+        mode,
+        num_excluded_abstracts,
+        num_included_abstracts,
+        preprompt,
+        prompt,
+        model,
+        include_dataset,
+        exclude_dataset,
+        gpt_cot_id=None,
+        few_shot_exclude=0,
+        few_shot_include=0,
+    ):
+        self.mode = mode
+        if mode == "test":
+            self.result_queue = stub.result_queue
+            print(
+                f"Running test mode with {num_excluded_abstracts} excluded abstracts and {num_included_abstracts} included abstracts"
+            )
+        elif mode == "gptcot":
+            self.result_queue = stub.cot_result_queue
+            print(
+                f"Running gptcot mode with {num_excluded_abstracts} excluded abstracts and {num_included_abstracts} included abstracts"
+            )
+            if gpt_cot_id is not None:
+                raise ValueError("gpt_cot_id should not be provided for gptcot mode")
+            if few_shot_exclude or few_shot_include:
+                raise ValueError(
+                    "few_shot_exclude or few_shot_include should not be provided for gptcot mode"
+                )
+        else:
+            raise ValueError(f"Invalid mode {mode}")
+        # Clear the persisted queue
+        self.result_queue.get_many(stub.result_queue.len(), False)
+        assert self.result_queue.len() == 0
+
+        self.num_excluded_abstracts = num_excluded_abstracts
+        self.num_included_abstracts = num_included_abstracts
+
+        self.preprompt = preprompt
+        self.prompt = prompt
+        self.model = model
+        
+        self.include_dataset = include_dataset
+        self.exclude_dataset = exclude_dataset
+
+        self.gpt_cot_id = gpt_cot_id
+        self.few_shot_exclude = few_shot_exclude
+        self.few_shot_include = few_shot_include
+        (
+            print(
+                f"Using {self.gpt_cot_id} as gpt_cot_id"
+            )
+            if self.gpt_cot_id
+            else print("No gpt_cot_id provided")
+        )
+        print(f"Using {few_shot_exclude} excluded fewshots and {few_shot_include} included fewshots") if (
+            few_shot_exclude or few_shot_include
+        ) else print("No fewshots provided")
+        if self.gpt_cot_id and not (self.few_shot_exclude or self.few_shot_include):
+            raise ValueError("gpt_cot_id provided but no fewshots")
+        self.total = self.count()
+
+    def count(self):
+        return self.num_excluded_abstracts + self.num_included_abstracts
+
+    def is_generated_few_shot(self):
+        return bool(self.gpt_cot_id)
+
+    def needs_append_few_shots(self):
+        return self.few_shot_exclude or self.few_shot_include
+
+    def load_abstracts(self):
+        import pandas as pd
+        import os
+        import numpy as np
+
+        # Load up volume files in memory
+        df_excluded = pd.read_csv(
+            os.path.join("/data", self.exclude_dataset), keep_default_na=False
+        )
+        excluded_abstracts = df_excluded["Abstract"].replace("", np.nan).dropna()
+        df_included = pd.read_csv(
+            os.path.join("/data", self.include_dataset), keep_default_na=False
+        )
+        included_abstracts = df_included["Abstract"].replace("", np.nan).dropna()
+        self.excluded_abstracts = excluded_abstracts
+        self.included_abstracts = included_abstracts
+
+    def get_abstract_series(self, actual_value="excluded"):
+        exclude = True if actual_value == "excluded" else False
+        if exclude:
+            return self.excluded_abstracts
+        else:
+            return self.included_abstracts
+
+    def get_cot_abstract_dataframe(self, actual_value="excluded"):
+        if self.gpt_cot is None:
+            raise ValueError("gpt_cot is not loaded")
+        return self.gpt_cot[self.gpt_cot["actual_value"] == actual_value]
+
+    def load_gpt_cot(self):
+        import pandas as pd
+        import os
+
+        if self.gpt_cot_id:
+            self.gpt_cot = pd.read_csv(
+                os.path.join(MOUNT_DIR_COT, f"cot_{self.gpt_cot_id}.csv")
+            )
+
+    def consume(self):
+        if self.num_excluded_abstracts > 0:
+            self.num_excluded_abstracts -= 1
+            return "excluded"
+        elif self.num_included_abstracts > 0:
+            self.num_included_abstracts -= 1
+            return "included"
+        else:
+            raise ValueError("No more abstracts to consume")
+
+    def default_rng(self, seed):
+        self.seed_generator = np.random.default_rng(seed)
+
+    def default_rng_few_shot(self):
+        """
+        Used to ensure few_shot generation is consistent across runs
+        """
+        return np.random.default_rng(self.seed_generator.integers(0, 2 ** 32 - 1))
+
+    def check_completion(self):
+        # Currently, failures not thrown during text generation completely stop execution.
+        if self.result_queue.len() != self.total:
+            raise ValueError(
+                "For some unknown reason there was an error processing the correct number of chain of thoughts"
+            )
+
+    def cleanup(self):
+        self.excluded_abstracts = None
+        self.included_abstracts = None
+        self.gpt_cot = None
 
 
 class Item(BaseModel):
-    name: str
-    number: int = 1
+    include_samples: int
+    exclude_samples: int
+    model: str = "gemini-pro"
     preprompt: str
     prompt: str
-    model: str = "gemini-pro"
-    few_shot: int = 0
+
     gpt_cot_id: str = None
     few_shot_exclude: int = 0
     few_shot_include: int = 0
+    
+    include_dataset: str
+    exclude_dataset: str
 
-
-class Result(BaseModel):
-    llm_answer: str
-    correct: bool
-    skipped: bool
-    prompt: str
-    error: str = ""
-    predicted_value: str = ""
-    is_excluded_value: str = ""
-    actual_value: str = ""
+    seed: int = 1
 
 
 class COTItem(BaseModel):
@@ -81,19 +235,34 @@ class COTItem(BaseModel):
     model: str = "gemini-pro"
     preprompt: str
     prompt: str
+    
+    include_dataset: str
+    exclude_dataset: str
 
     seed: int = 1
 
 
-class COTResult(BaseModel):
+class Result(BaseModel):
     prompt: str
-    llm_answer: str
+    llm_answer: Union[str, None]
 
     correct: bool
     skipped: bool
 
-    error: str = None
-    predicted_value: str = ""
+    error: Union[str, None] = None
+    predicted_value: Union[str, None] = ""
+    actual_value: str = ""
+
+
+class COTResult(BaseModel):
+    prompt: str
+    llm_answer: Union[str, None]
+
+    correct: bool
+    skipped: bool
+
+    error: Union[str, None] = None
+    predicted_value: Union[str, None] = ""
     actual_value: str = ""
     test_abstract: str = ""
 
@@ -102,83 +271,61 @@ class COTResult(BaseModel):
 @modal.web_endpoint(label="submit", method="POST")
 def f(item: Item):
     correct_count = 0
-    total_actually_processed = 0
-    skipped = 0
+    completed_count = 0
+    skipped_count = 0
     results = []
     mode = "test"
 
-    total_prompts = item.number
-    # until we get like tier 6 rate limiting, we should really only use one machine
-    prompts_per_cpu = 99999999
-    number_of_cpus = ((total_prompts - 1) // prompts_per_cpu) + 1
+    total_prompts = item.include_samples + item.exclude_samples
 
-    # clear the persisted queue
-    stub.result_queue.get_many(stub.result_queue.len(), False)
-    assert stub.result_queue.len() == 0
+    generation_task = GenerationTask(
+        mode,
+        item.exclude_samples,
+        item.include_samples,
+        item.preprompt,
+        item.prompt,
+        item.model,
+        item.include_dataset,
+        item.exclude_dataset,
+        gpt_cot_id=item.gpt_cot_id,
+        few_shot_exclude=item.few_shot_exclude,
+        few_shot_include=item.few_shot_include,
+    )
 
-    # function: now split the total prompts into the number of cpus with remainders
-    def split_prompts(total_prompts, number_of_cpus):
-        prompts_per_cpu = total_prompts // number_of_cpus
-        prompts = [prompts_per_cpu] * number_of_cpus
-        for i in range(total_prompts % number_of_cpus):
-            prompts[i] += 1
-        return [[i, prompt] for i, prompt in enumerate(prompts)]
+    gen.remote(
+        item.seed,
+        generation_task,
+    )
 
-    for res in gen.starmap(
-        split_prompts(total_prompts, number_of_cpus),
-        kwargs={
-            "preprompt": item.preprompt,
-            "prompt": item.prompt,
-            "model": item.model,
-            "few_shot": item.few_shot,
-            "mode": mode,
-            "gpt_cot_id": item.gpt_cot_id,
-            "few_shot_exclude": item.few_shot_exclude,
-            "few_shot_include": item.few_shot_include,
-        },
-    ):
-        pass
-    # Currently, failures not thrown during text generation completely stop execution.
-    if stub.result_queue.len() != total_prompts:
-        raise ValueError(
-            "For some unknown reason there was an error processing the correct number of tests. This is very likely fixed by starting the server."
-        )
+    generation_task.check_completion()
+
     for res in stub.result_queue.get_many(total_prompts):
-        if res[0]:
-            results.append(
-                Result(
-                    llm_answer="No answer",
-                    correct=False,
-                    skipped=True,
-                    prompt=res[2],
-                    error=str(res[1]),
-                )
-            )
-            skipped += 1
-            continue
-        total_actually_processed += 1
-        _, correct, prompt, llm_answer, predicted_value, actual_value, _ = res
+        if res["skipped"]:
+            skipped_count += 1
+        else:
+            if res["correct"]:
+                correct_count += 1
+            completed_count += 1
+
         results.append(
             Result(
-                llm_answer=llm_answer,
-                correct=correct,
-                skipped=False,
-                prompt=prompt,
-                predicted_value=predicted_value,
-                is_excluded_value=actual_value,
-                actual_value=actual_value,
+                prompt=res["prompt"],
+                llm_answer=res["llm_answer"],
+                correct=res["correct"],
+                skipped=res["skipped"],
+                predicted_value=res["predicted_value"],
+                actual_value=res["actual_value"],
+                error=str(res["error"]) if res["skipped"] else None,
             )
         )
-        if correct:
-            correct_count += 1
 
     status_tracker: StatusTracker = stub.status_tracker[mode]
 
     return {
         "results": results,
         "total_correct": correct_count,
-        "total": total_actually_processed,
-        "total_skipped": skipped,
+        "total": completed_count,
+        "total_skipped": skipped_count,
         "status_tracker": status_tracker.__dict__,
     }
 
@@ -186,82 +333,58 @@ def f(item: Item):
 @stub.function(volumes={MOUNT_DIR_COT: cot_vol})
 @modal.web_endpoint(label="gptcot", method="POST")
 async def gptcot(item: COTItem):
+
     correct_count = 0
-    total_actually_processed = 0
-    skipped = 0
+    completed_count = 0
+    skipped_count = 0
     results = []
     mode = "gptcot"
 
-    total_exclude_prompts = item.exclude_samples
-    total_include_prompts = item.include_samples
+    num_excluded_abstracts = item.exclude_samples
+    num_included_abstracts = item.include_samples
 
-    stub.cot_result_queue.get_many(stub.cot_result_queue.len(), False)
-    assert stub.cot_result_queue.len() == 0
+    total_prompts = num_excluded_abstracts + num_included_abstracts
+
+    generation_task = GenerationTask(
+        mode,
+        num_excluded_abstracts,
+        num_included_abstracts,
+        item.preprompt,
+        item.prompt,
+        item.model,
+        item.include_dataset,
+        item.exclude_dataset,
+    )
 
     gen.remote(
         item.seed,
-        total_include_prompts + total_exclude_prompts,
-        preprompt=item.preprompt,
-        prompt=item.prompt,
-        model=item.model,
-        few_shot=0,
-        num_exclude_prompts=total_exclude_prompts,
-        num_include_prompts=total_include_prompts,
-        mode=mode
+        generation_task,
     )
 
-    total_prompts = total_exclude_prompts + total_include_prompts
+    generation_task.check_completion()
 
-    # Currently, failures not thrown during text generation completely stop execution.
-    if stub.cot_result_queue.len() != total_prompts:
-        raise ValueError(
-            "For some unknown reason there was an error processing the correct number of chain of thoughts"
-        )
+    for res in generation_task.result_queue.get_many(total_prompts):
+        if res["skipped"]:
+            skipped_count += 1
+        else:
+            if res["correct"]:
+                correct_count += 1
+            completed_count += 1
 
-    for res in stub.cot_result_queue.get_many(total_prompts):
-        if res[0]:
-            results.append(
-                COTResult(
-                    llm_answer="No answer",
-                    correct=False,
-                    skipped=True,
-                    prompt=res[2],
-                    error=str(res[1]),
-                )
-            )
-            skipped += 1
-            continue
-        total_actually_processed += 1
-        (
-            _,
-            correct,
-            prompt,
-            llm_answer,
-            predicted_value,
-            actual_value,
-            test_abstract,
-        ) = res
         results.append(
             COTResult(
-                prompt=prompt,
-                llm_answer=llm_answer,
-                correct=correct,
-                skipped=False,
-                predicted_value=predicted_value,
-                actual_value=actual_value,
-                test_abstract=test_abstract,
+                prompt=res["prompt"],
+                llm_answer=res.get("llm_answer"),
+                correct=res["correct"],
+                skipped=res["skipped"],
+                predicted_value=res["predicted_value"],
+                actual_value=res["actual_value"],
+                test_abstract=res["test_abstract"],
+                error=str(res["error"]) if res["skipped"] else None,
             )
         )
-        if correct:
-            correct_count += 1
 
     status_tracker = stub.status_tracker[mode]
-
-    import uuid
-
-    def generate_unique_id():
-        unique_id = str(uuid.uuid4())[:8]
-        return unique_id
 
     unique_id = generate_unique_id()
 
@@ -291,15 +414,17 @@ async def gptcot(item: COTItem):
         cot_vol.commit()
 
     filter_and_save_results(unique_id, results)
+    
+    print("Completed and saved as ", unique_id)
 
     return {
         "results": results,
         "total_correct": correct_count,
-        "total": total_actually_processed,
-        "total_skipped": skipped,
+        "total": completed_count,
+        "total_skipped": skipped_count,
         "status_tracker": status_tracker.__dict__,
-        "total_exclude_prompts": total_exclude_prompts,
-        "total_include_prompts": total_include_prompts,
+        "total_exclude_prompts": num_excluded_abstracts,
+        "total_include_prompts": num_included_abstracts,
         "model": item.model,
         "id": unique_id,
     }
@@ -360,6 +485,7 @@ def setup(model):
                         messages=generate_messages(model, prompt),
                         model=model,
                         max_tokens=MAX_COMPLETION_TOKENS,
+                        seed=TEXT_SEED,
                     )
                 )
                 .choices[0]
@@ -429,41 +555,6 @@ def generate_messages(model, prompt):
         raise ValueError(f"Invalid model generate_messages {model}")
 
 
-def load_abstracts(excluded_file=EXCLUDED_ABSTRACTS, included_file=INCLUDED_ABSTRACTS):
-    import pandas as pd
-
-    # Load up volume files in memory
-    df_excluded = pd.read_csv(
-        os.path.join("/data", excluded_file), keep_default_na=False
-    )
-    abstracts_excluded = df_excluded["Abstract"].replace("", np.nan).dropna()
-    df_included = pd.read_csv(
-        os.path.join("/data", included_file), keep_default_na=False
-    )
-    abstracts_included = df_included["Abstract"].replace("", np.nan).dropna()
-    return {"excluded": abstracts_excluded, "included": abstracts_included}
-
-def load_gpt_cot(gpt_cot_id):
-    import pandas as pd
-
-    if gpt_cot_id:
-        df = pd.read_csv(os.path.join(MOUNT_DIR_COT, f"cot_{gpt_cot_id}.csv"))
-        return df
-    else:
-        return None
-
-def choose_abstract_type(mode, seed_generator=None, num_exclude_prompts=None):
-    if mode == "test":
-        if seed_generator is None:
-            raise ValueError("No seed generator")
-        return seed_generator.choice([True, False])
-    elif mode == "gptcot":
-        if num_exclude_prompts is None:
-            raise ValueError("No number of exclude prompts")
-        return True if num_exclude_prompts else False
-    raise ValueError(f"Invalid mode {mode}")
-
-
 @stub.function(
     volumes={MOUNT_DIR: vol, MOUNT_DIR_COT: cot_vol},
     secrets=[
@@ -474,36 +565,29 @@ def choose_abstract_type(mode, seed_generator=None, num_exclude_prompts=None):
     cpu=2.0,
 )
 async def gen(
-    seed,
-    num_of_prompts,
-    preprompt=None,
-    prompt=None,
-    model=None,
-    few_shot=0,
-    mode="test",
-    exclude_abstract_file=EXCLUDED_ABSTRACTS,
-    include_abstract_file=INCLUDED_ABSTRACTS,
-    num_exclude_prompts=None,
-    num_include_prompts=None,
-    gpt_cot_id=None,
-    few_shot_exclude=0,
-    few_shot_include=0,
+    seed: int,
+    generation_task: GenerationTask,
 ):
-    if preprompt is None or prompt is None or model is None:
-        raise ValueError("Missing parameters")
     import asyncio
-    import numpy as np
     import logging
+
     cot_vol.reload()
 
-    seed_generator = np.random.default_rng(seed)
+    ### SLOW Reading from disk
+    generation_task.load_abstracts()
+    generation_task.load_gpt_cot()
+    generation_task.default_rng(seed)
+    ### SLOW Reading from disk
+
     # initialize logging
     logging_level = logging.INFO
     logging.basicConfig(level=logging_level)
     logging.debug(f"Logging initialized at level {logging_level}")
 
     # it seems like gemini-pro has a rate limit that updates every half minute
-    seconds_to_pause_after_rate_limit_error = 30 if model == "gemini-pro" else 15
+    seconds_to_pause_after_rate_limit_error = (
+        30 if generation_task.model == "gemini-pro" else 15
+    )
     seconds_to_sleep_each_loop = (
         0.001  # 1 ms limits max throughput to 1,000 requests per second
     )
@@ -512,41 +596,24 @@ async def gen(
     status_tracker = StatusTracker()
     next_request = None  # variable to hold the next request to call
     # initialize available capacity counts
-    max_requests_per_minute = USAGE_LIMITS[model]["max_requests_per_minute"]
-    max_tokens_per_minute = USAGE_LIMITS[model]["max_tokens_per_minute"]
+    max_requests_per_minute = USAGE_LIMITS[generation_task.model][
+        "max_requests_per_minute"
+    ]
+    max_tokens_per_minute = USAGE_LIMITS[generation_task.model]["max_tokens_per_minute"]
     available_request_capacity = max_requests_per_minute
     available_token_capacity = max_tokens_per_minute
     last_update_time = time.time()
 
-    abstract_files = load_abstracts(exclude_abstract_file, include_abstract_file)
-    gpt_cot_dataframe = load_gpt_cot(gpt_cot_id)
-
     while True:
         if next_request is None:
-            if num_of_prompts:
-                logging.info(f"num_of_prompts left: {num_of_prompts}")
+            if generation_task.count():
+                logging.info(f"Number of prompts left left: {generation_task.count()}")
                 next_request = Abstract(
                     task_id=next(task_id_generator),
-                    preprompt=preprompt,
-                    prompt=prompt,
-                    model=model,
-                    few_shot=few_shot,
+                    generation_task=generation_task,
                     attempts_left=3,
-                    excluded=choose_abstract_type(
-                        mode,
-                        seed_generator=seed_generator,
-                        num_exclude_prompts=num_exclude_prompts,
-                    ),  # change:num_prompts upgraded to split into two streams of exclude/include
-                    abstract_files=abstract_files,
-                    mode=mode,
-                    gpt_cot_dataframe=gpt_cot_dataframe,
-                    few_shot_exclude=few_shot_exclude,
-                    few_shot_include=few_shot_include,
                 )
-                next_request.setup(seed_generator)
-                num_of_prompts -= 1
-                if num_exclude_prompts is not None and num_exclude_prompts > 0:
-                    num_exclude_prompts -= 1
+                next_request.setup()
                 status_tracker.start()
                 logging.info(f"Instantiating task {next_request.task_id}")
             elif not queue_of_requests_to_retry.empty():
@@ -613,8 +680,9 @@ async def gen(
             f"{status_tracker.num_rate_limit_errors} rate limit errors received. Consider running at a lower rate."
         )
 
-    stub.status_tracker[mode] = status_tracker
+    stub.status_tracker[generation_task.mode] = status_tracker
 
+    generation_task.cleanup()
     return 1
 
 
@@ -663,140 +731,139 @@ class StatusTracker:
 @dataclass
 class Abstract:
     task_id: int
+    attempts_left: int
+    generation_task: GenerationTask
 
-    preprompt: str
-    prompt: str
-    model: str
-    few_shot: int
-    excluded: bool
-    abstract_files: dict
-    mode: str
-
-    attempts_left: int = 0
-    result: list = field(default_factory=list)
-
+    actual_value: str = None
     final_prompt: str = None
+    result: list = field(default_factory=list)
     token_consumption: int = 0
-    test_abstract: str = ""
-    gpt_cot_dataframe: pd.DataFrame = None
-    few_shot_include: int = 0
-    few_shot_exclude: int = 0
+    abstract: str = ""
 
-    def sample_abstract(self, excluded, seed_generator, n=1):
-        file = "excluded" if excluded else "included"
+    def sample_abstract(self, actual_value, seed_generator, n=1):
 
         abstracts = (
-            self.abstract_files[file].sample(n=n, random_state=seed_generator).tolist()
+            self.generation_task.get_abstract_series(actual_value=actual_value)
+            .sample(n=n, random_state=seed_generator)
+            .tolist()
         )
 
         return abstracts
-    
-    def sample_cot_abstract(self, excluded, seed_generator, n=1):
-        file = "excluded" if excluded else "included"
 
-        searchable_abstracts = self.gpt_cot_dataframe[self.gpt_cot_dataframe["actual_value"] == file]
+    def sample_cot_abstract(self, actual_value, seed_generator, n=1):
+        searchable_abstracts = self.generation_task.get_cot_abstract_dataframe(
+            actual_value=actual_value
+        )
         if len(searchable_abstracts) < n:
-            raise ValueError(f"Insufficient number of abstracts to sample from. {len(searchable_abstracts)} < {n}")
-        abstracts = (
-            searchable_abstracts.sample(n=n, random_state=seed_generator).to_dict('records')
-        )
+            raise ValueError(
+                f"Insufficient number of abstracts to sample from. {len(searchable_abstracts)} < {n}"
+            )
+        abstracts = searchable_abstracts.sample(
+            n=n, random_state=seed_generator
+        ).to_dict("records")
 
         return abstracts
 
-    def setup(self, seed_generator: np.random.Generator):
+    def setup(self):
         if self.final_prompt:
             return
+        self.actual_value = self.generation_task.consume()
         # Get a random abstract
-        test_abstracts = self.sample_abstract(self.excluded, seed_generator, n=1)
-        test_abstract = test_abstracts[0]
-        self.test_abstract = test_abstract
+        self.abstract = self.sample_abstract(
+            self.actual_value, self.generation_task.seed_generator, n=1
+        )[0]
+
+        seed_generator_few_shot = self.generation_task.default_rng_few_shot()
 
         few_shot_text = ""
-        if self.few_shot:
-            few_shot_text += "\nExamples:\n"
-            number_include = self.few_shot // 2
-            number_exclude = self.few_shot - number_include
+        if self.generation_task.needs_append_few_shots():
+            if not self.generation_task.is_generated_few_shot():
+                few_shot_text += "\nExamples:\n"
+                number_include = self.generation_task.few_shot_include
+                number_exclude = self.generation_task.few_shot_exclude
 
-            few_shot_exclusionary_abstracts = self.sample_abstract(
-                True, seed_generator, n=number_exclude
-            )
-            few_shot_inclusionary_abstracts = self.sample_abstract(
-                False, seed_generator, n=number_include
-            )
+                few_shot_exclusionary_abstracts = self.sample_abstract(
+                    "excluded", seed_generator_few_shot, n=number_exclude
+                )
+                few_shot_inclusionary_abstracts = self.sample_abstract(
+                    "included", seed_generator_few_shot, n=number_include
+                )
 
-            for abstract in few_shot_exclusionary_abstracts:
-                few_shot_text += f"""
----
-{abstract}
+                for abstract in few_shot_exclusionary_abstracts:
+                    few_shot_text += f"""
+    ---
+    {abstract}
 
-This article should be excluded.
-"""
-            for abstract in few_shot_inclusionary_abstracts:
-                few_shot_text += f"""
----
-{abstract}
+    This article should be excluded.
+    """
+                for abstract in few_shot_inclusionary_abstracts:
+                    few_shot_text += f"""
+    ---
+    {abstract}
 
-This article should be included.
+    This article should be included.
 
-"""
-            few_shot_text += "---\nEND OF EXAMPLES\n"
-        if self.gpt_cot_dataframe is not None and not self.gpt_cot_dataframe.empty and (self.few_shot_exclude or self.few_shot_include):
-            few_shot_text += "\n# Examples\n"
-            number_include = self.few_shot_include
-            number_exclude = self.few_shot_exclude
+    """
+                few_shot_text += "---\nEND OF EXAMPLES\n"
+            elif self.generation_task.is_generated_few_shot():
+                few_shot_text += "\n# Examples\n"
+                number_include = self.generation_task.few_shot_include
+                number_exclude = self.generation_task.few_shot_exclude
 
-            few_shot_exclusionary_abstracts = self.sample_cot_abstract(
-                True, seed_generator, n=number_exclude
-            )
-            few_shot_inclusionary_abstracts = self.sample_cot_abstract(
-                False, seed_generator, n=number_include
-            )
+                few_shot_exclusionary_abstracts = self.sample_cot_abstract(
+                    "excluded", seed_generator_few_shot, n=number_exclude
+                )
+                few_shot_inclusionary_abstracts = self.sample_cot_abstract(
+                    "included", seed_generator_few_shot, n=number_include
+                )
 
-            for abstract in few_shot_exclusionary_abstracts:
-                few_shot_text += f"""
-## Example Abstract
-{abstract["abstract"]}
+                for abstract in few_shot_exclusionary_abstracts:
+                    few_shot_text += f"""
+    ## Example Abstract
+    {abstract["abstract"]}
 
-## Rationale and Conclusion
-{abstract["chain_of_thought"]}
-"""
-            for abstract in few_shot_inclusionary_abstracts:
-                few_shot_text += f"""
-## Example Abstract
-{abstract["abstract"]}
+    ## Rationale and Conclusion
+    {abstract["chain_of_thought"]}
+    """
+                for abstract in few_shot_inclusionary_abstracts:
+                    few_shot_text += f"""
+    ## Example Abstract
+    {abstract["abstract"]}
 
-## Rationale and Conclusion
-{abstract["chain_of_thought"]}
-"""
-            few_shot_text += "\n# End of Examples\n"
+    ## Rationale and Conclusion
+    {abstract["chain_of_thought"]}
+    """
+                few_shot_text += "\n# End of Examples\n"
+            else:
+                raise ValueError("Invalid few shot generation")
 
         # Create the prompt and get the response
-        self.final_prompt = f"{self.preprompt}\n{few_shot_text}\n# Abstract in investigation: \n{test_abstract}\n\n{self.prompt}\n"
+        self.final_prompt = FINAL_PROMPT.format(
+            preprompt=self.generation_task.preprompt,
+            few_shot_text=few_shot_text,
+            test_abstract=self.abstract,
+            prompt=self.generation_task.prompt,
+        )
         self.token_consumption = calculate_tokens(
-            self.model, self.final_prompt, MAX_COMPLETION_TOKENS
+            self.generation_task.model, self.final_prompt, MAX_COMPLETION_TOKENS
         )
 
     async def single_abstract(
         self, retry_queue: asyncio.Queue, status_tracker: StatusTracker
     ):
-        result_queue = (
-            stub.result_queue if self.mode == "test" else stub.cot_result_queue
-        )
         if self.attempts_left < 0:
             raise ValueError("attempts_left should never be negative")
         error = None
         try:
             ###### BUSINESS
             # Setup the model
-            model_async = setup.local(self.model)
+            model_async = setup.local(self.generation_task.model)
 
             # Model produces response
-            llm_answer = None
             llm_answer = await model_async(self.final_prompt)
 
             # Evaluate response
             predicted_value = is_excluded(llm_answer, self.final_prompt)
-            actual_value = "excluded" if self.excluded else "included"
             ###### BUSINESS
         except Exception as e:
             if "Rate limit" in str(e) or "429" in str(e):
@@ -809,24 +876,27 @@ This article should be included.
             if self.attempts_left:
                 retry_queue.put_nowait(self)
             else:
-                result_queue.put(
-                    [True, [str(e) for e in self.result], self.final_prompt]
+                self.generation_task.result_queue.put(
+                    {
+                        "skipped": True,
+                        "prompt": self.final_prompt,
+                        "error": [str(e) for e in self.result],
+                    }
                 )
                 status_tracker.fail()
         else:
-            result_queue.put(
-                [
-                    False,
-                    predicted_value == actual_value,
-                    self.final_prompt,
-                    llm_answer,
-                    predicted_value,
-                    actual_value,
-                    self.test_abstract,
-                ]
+            self.generation_task.result_queue.put(
+                {
+                    "skipped": False,
+                    "correct": predicted_value == self.actual_value,
+                    "predicted_value": predicted_value,
+                    "actual_value": self.actual_value,
+                    "llm_answer": llm_answer,
+                    "prompt": self.final_prompt,
+                    "test_abstract": self.abstract,
+                }
             )
             status_tracker.success()
-
 
 ##### GENERAL HELPERS ######################################################
 
@@ -838,6 +908,24 @@ def task_id_generator_function():
         yield task_id
         task_id += 1
 
+
+def generate_unique_id():
+    import uuid
+
+    unique_id = str(uuid.uuid4())[:8]
+    return unique_id
+
+
 @stub.local_entrypoint()
 async def main():
-    print(await gptcot.local(COTItem(include_samples=1, exclude_samples=1, model="gemini-pro", preprompt="preprompt", prompt="prompt")))
+    print(
+        await gptcot.local(
+            COTItem(
+                include_samples=1,
+                exclude_samples=1,
+                model="gemini-pro",
+                preprompt="preprompt",
+                prompt="prompt",
+            )
+        )
+    )
