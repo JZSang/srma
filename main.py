@@ -64,6 +64,19 @@ stub.cot_result_queue = modal.Queue.new()
 stub.status_tracker = modal.Dict.new()
 
 
+@stub.function()
+@modal.web_endpoint(label="status", method="GET")
+def get_status(mode):
+    return stub.status_tracker[mode].__dict__
+
+@stub.function()
+@modal.web_endpoint(label="kill", method="POST")
+def kill(mode):
+    if mode != "test" and mode != "gptcot":
+        raise ValueError(f"Invalid mode {mode}")
+    stub.status_tracker[mode + "kill"] = True
+    return True
+
 class GenerationTask:
     excluded_abstracts = None
     included_abstracts = None
@@ -112,7 +125,7 @@ class GenerationTask:
         self.preprompt = preprompt
         self.prompt = prompt
         self.model = model
-        
+
         self.include_dataset = include_dataset
         self.exclude_dataset = exclude_dataset
 
@@ -120,15 +133,17 @@ class GenerationTask:
         self.few_shot_exclude = few_shot_exclude
         self.few_shot_include = few_shot_include
         (
-            print(
-                f"Using {self.gpt_cot_id} as gpt_cot_id"
-            )
+            print(f"Using {self.gpt_cot_id} as gpt_cot_id")
             if self.gpt_cot_id
             else print("No gpt_cot_id provided")
         )
-        print(f"Using {few_shot_exclude} excluded fewshots and {few_shot_include} included fewshots") if (
-            few_shot_exclude or few_shot_include
-        ) else print("No fewshots provided")
+        (
+            print(
+                f"Using {few_shot_exclude} excluded fewshots and {few_shot_include} included fewshots"
+            )
+            if (few_shot_exclude or few_shot_include)
+            else print("No fewshots provided")
+        )
         if self.gpt_cot_id and not (self.few_shot_exclude or self.few_shot_include):
             raise ValueError("gpt_cot_id provided but no fewshots")
         self.total = self.count()
@@ -197,7 +212,7 @@ class GenerationTask:
         """
         Used to ensure few_shot generation is consistent across runs
         """
-        return np.random.default_rng(self.seed_generator.integers(0, 2 ** 32 - 1))
+        return np.random.default_rng(self.seed_generator.integers(0, 2**32 - 1))
 
     def check_completion(self):
         # Currently, failures not thrown during text generation completely stop execution.
@@ -211,6 +226,8 @@ class GenerationTask:
         self.included_abstracts = None
         self.gpt_cot = None
 
+class KillException(Exception):
+    pass
 
 class Item(BaseModel):
     include_samples: int
@@ -222,7 +239,7 @@ class Item(BaseModel):
     gpt_cot_id: str = None
     few_shot_exclude: int = 0
     few_shot_include: int = 0
-    
+
     include_dataset: str
     exclude_dataset: str
 
@@ -235,7 +252,7 @@ class COTItem(BaseModel):
     model: str = "gemini-pro"
     preprompt: str
     prompt: str
-    
+
     include_dataset: str
     exclude_dataset: str
 
@@ -275,6 +292,8 @@ def f(item: Item):
     skipped_count = 0
     results = []
     mode = "test"
+    
+    stub.status_tracker[mode + "kill"] = False
 
     total_prompts = item.include_samples + item.exclude_samples
 
@@ -292,10 +311,15 @@ def f(item: Item):
         few_shot_include=item.few_shot_include,
     )
 
-    gen.remote(
-        item.seed,
-        generation_task,
-    )
+    try:
+        gen.remote(
+            item.seed,
+            generation_task,
+        )
+    except KillException:
+        stub.status_tracker[mode + "kill"] = False
+        from fastapi import HTTPException
+        raise HTTPException(status_code=499, detail="User killed operation")
 
     generation_task.check_completion()
 
@@ -310,7 +334,7 @@ def f(item: Item):
         results.append(
             Result(
                 prompt=res["prompt"],
-                llm_answer=res["llm_answer"],
+                llm_answer=res.get("llm_answer"),
                 correct=res["correct"],
                 skipped=res["skipped"],
                 predicted_value=res["predicted_value"],
@@ -320,6 +344,7 @@ def f(item: Item):
         )
 
     status_tracker: StatusTracker = stub.status_tracker[mode]
+    stub.status_tracker[mode] = StatusTracker(mode)
 
     return {
         "results": results,
@@ -333,12 +358,13 @@ def f(item: Item):
 @stub.function(volumes={MOUNT_DIR_COT: cot_vol})
 @modal.web_endpoint(label="gptcot", method="POST")
 async def gptcot(item: COTItem):
-
     correct_count = 0
     completed_count = 0
     skipped_count = 0
     results = []
     mode = "gptcot"
+    
+    stub.status_tracker[mode + "kill"] = False
 
     num_excluded_abstracts = item.exclude_samples
     num_included_abstracts = item.include_samples
@@ -356,10 +382,15 @@ async def gptcot(item: COTItem):
         item.exclude_dataset,
     )
 
-    gen.remote(
-        item.seed,
-        generation_task,
-    )
+    try:
+        gen.remote(
+            item.seed,
+            generation_task,
+        )
+    except KillException:
+        stub.status_tracker[mode + "kill"] = False
+        from fastapi import HTTPException
+        raise HTTPException(status_code=499, detail="User killed operation")
 
     generation_task.check_completion()
 
@@ -385,7 +416,8 @@ async def gptcot(item: COTItem):
         )
 
     status_tracker = stub.status_tracker[mode]
-
+    stub.status_tracker[mode] = StatusTracker(mode)
+    
     unique_id = generate_unique_id()
 
     def filter_and_save_results(unique_id, results):
@@ -414,7 +446,7 @@ async def gptcot(item: COTItem):
         cot_vol.commit()
 
     filter_and_save_results(unique_id, results)
-    
+
     print("Completed and saved as ", unique_id)
 
     return {
@@ -593,7 +625,7 @@ async def gen(
     )
     queue_of_requests_to_retry = asyncio.Queue()
     task_id_generator = task_id_generator_function()
-    status_tracker = StatusTracker()
+    status_tracker = StatusTracker(generation_task.mode)
     next_request = None  # variable to hold the next request to call
     # initialize available capacity counts
     max_requests_per_minute = USAGE_LIMITS[generation_task.model][
@@ -655,6 +687,9 @@ async def gen(
         if status_tracker.num_tasks_in_progress <= 0:
             break
 
+        will_die = stub.status_tracker[generation_task.mode + "kill"]
+        if will_die:
+            raise KillException("Killed")
         # main loop sleeps briefly so concurrent tasks can run
         await asyncio.sleep(seconds_to_sleep_each_loop)
 
@@ -693,7 +728,10 @@ async def gen(
 def ls():
     import glob
 
-    return [os.path.basename(file) for file in glob.glob(f"{MOUNT_DIR}/*.csv")]
+    return [
+        {"name": os.path.basename(file), "size": os.path.getsize(file)}
+        for file in glob.glob(f"{MOUNT_DIR}/*.csv")
+    ]
 
 
 ### PARALLEL PROCESSING HELPERS ##########################################
@@ -703,6 +741,7 @@ def ls():
 class StatusTracker:
     """Stores metadata about the script's progress. Only one instance is created."""
 
+    mode: str
     num_tasks_started: int = 0
     num_tasks_in_progress: int = 0  # script ends when this reaches 0
     num_tasks_succeeded: int = 0
@@ -715,18 +754,19 @@ class StatusTracker:
     def start(self):
         self.num_tasks_started += 1
         self.num_tasks_in_progress += 1
-
+        stub.status_tracker[self.mode] = self
     def error(self):
         self.num_other_errors += 1
-
+        stub.status_tracker[self.mode] = self
     def fail(self):
         self.num_tasks_in_progress -= 1
         self.num_tasks_failed += 1
-
+        stub.status_tracker[self.mode] = self
     def success(self):
         self.num_tasks_in_progress -= 1
         self.num_tasks_succeeded += 1
-
+        stub.status_tracker[self.mode] = self
+        
 
 @dataclass
 class Abstract:
@@ -881,6 +921,11 @@ class Abstract:
                         "skipped": True,
                         "prompt": self.final_prompt,
                         "error": [str(e) for e in self.result],
+                        "correct": False,
+                        "predicted_value": "fail",
+                        "actual_value": "fail",
+                        "llm_answer": "fail",
+                        "test_abstract": self.abstract,
                     }
                 )
                 status_tracker.fail()
@@ -888,15 +933,17 @@ class Abstract:
             self.generation_task.result_queue.put(
                 {
                     "skipped": False,
+                    "prompt": self.final_prompt,
+                    "error": None,
                     "correct": predicted_value == self.actual_value,
                     "predicted_value": predicted_value,
                     "actual_value": self.actual_value,
                     "llm_answer": llm_answer,
-                    "prompt": self.final_prompt,
                     "test_abstract": self.abstract,
                 }
             )
             status_tracker.success()
+
 
 ##### GENERAL HELPERS ######################################################
 
@@ -916,16 +963,63 @@ def generate_unique_id():
     return unique_id
 
 
-@stub.local_entrypoint()
-async def main():
-    print(
-        await gptcot.local(
-            COTItem(
-                include_samples=1,
-                exclude_samples=1,
-                model="gemini-pro",
-                preprompt="preprompt",
-                prompt="prompt",
-            )
-        )
+@stub.function(
+    volumes={MOUNT_DIR: vol},
+)
+def create_subsets():
+    import os
+    import pandas as pd
+
+    files = os.listdir(MOUNT_DIR)
+    files = [file for file in files if file.endswith(".csv")]
+
+    # split into train and test sets, use 1k from each file for train, 1k for validation, and the rest for testing
+    trues = list(create_subset.map(files))
+    print(trues, os.listdir(MOUNT_DIR))
+    return True
+
+
+@stub.function(
+    volumes={MOUNT_DIR: vol},
+)
+def create_subset(file):
+    import os
+    import pandas as pd
+
+    print("Processing ", file)
+    df = pd.read_csv(os.path.join(MOUNT_DIR, file), low_memory=False)
+    # remove .csv from end of filename using os
+    file = os.path.splitext(file)[0]
+    train = df.sample(1000)
+    df = df.drop(train.index)
+    validation = df.sample(1000)
+    test = df.drop(validation.index)
+    train.to_csv(os.path.join(MOUNT_DIR, f"{file}_train_1000.csv"), index=False)
+    print("Train saved as ", f"{file}_train_1000.csv")
+    validation.to_csv(
+        os.path.join(MOUNT_DIR, f"{file}_validation_1000.csv"), index=False
     )
+    print("Validation saved as ", f"{file}_validation_1000.csv")
+    test.to_csv(os.path.join(MOUNT_DIR, f"{file}_test.csv"), index=False)
+    print("Test saved as ", f"{file}_test.csv")
+    vol.commit()
+    return True
+
+# @stub.function(
+#     volumes={MOUNT_DIR: vol},
+# )
+# def remove_files():
+#     import os
+#     import glob
+#     # glob pattern = *.csv_*
+#     glob_pattern = os.path.join(MOUNT_DIR, "*.csv_*")
+#     files = glob.glob(glob_pattern)
+#     print(files)
+#     for file in files:
+#         os.remove(os.path.join(MOUNT_DIR, file))
+#     vol.commit()
+#     return True
+
+@stub.local_entrypoint()
+def main():
+    create_subsets.remote()
