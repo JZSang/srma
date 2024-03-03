@@ -20,7 +20,7 @@ USAGE_LIMITS = {
     },
     "gpt-4-0125-preview": {
         "max_requests_per_minute": 500,
-        "max_tokens_per_minute": 150000,
+        "max_tokens_per_minute": 300000,
     },
     "gpt-3.5-turbo-0125": {
         "max_requests_per_minute": 500,
@@ -189,17 +189,28 @@ class GenerationTask:
         self.excluded_abstracts = excluded_abstracts
         self.included_abstracts = included_abstracts
 
-    def get_abstract_series(self, actual_value="excluded"):
+    def get_abstracts(self, actual_value="excluded", n=1, random_state=None):
+        if self.abstract_in_investigation:
+            import pandas as pd
+            return pd.Series([self.abstract_in_investigation])
         exclude = True if actual_value == "excluded" else False
         if exclude:
-            return self.excluded_abstracts
+            samples = self.excluded_abstracts.sample(n=n, random_state=random_state)
+            # Sample without replacement
+            self.excluded_abstracts = self.excluded_abstracts.drop(samples.index)
+            return samples
         else:
-            return self.included_abstracts
+            samples = self.included_abstracts.sample(n=n, random_state=random_state)
+            # Sample without replacement
+            self.included_abstracts = self.included_abstracts.drop(samples.index)
+            return samples
 
-    def get_cot_abstract_dataframe(self, actual_value="excluded"):
+    def get_cot_abstract_dataframe(self, actual_value="excluded", n=1, seed_generator=None):
         if self.gpt_cot is None:
             raise ValueError("gpt_cot is not loaded")
-        return self.gpt_cot[self.gpt_cot["actual_value"] == actual_value]
+        return self.gpt_cot[self.gpt_cot["actual_value"] == actual_value].sample(
+            n=n, random_state=seed_generator, replace=False
+        )
 
     def load_gpt_cot(self):
         import pandas as pd
@@ -233,7 +244,7 @@ class GenerationTask:
         return np.random.default_rng(self.seed_generator.integers(0, 2**32 - 1))
 
     def check_completion(self):
-        # Currently, failures not thrown during text generation completely stop execution.
+        # Currently, failures not thrown during text generation do not stop execution.
         if self.result_queue.len() != self.total:
             print("ERROR ### result_queue.len() != self.total, returning what's left anyways")
 
@@ -366,6 +377,8 @@ def f(item: Item):
 
     status_tracker: StatusTracker = stub.status_tracker[mode]
     stub.status_tracker[mode] = StatusTracker(mode)
+    
+    print("Completed, status: ", status_tracker.__dict__)
 
     return {
         "results": results,
@@ -619,7 +632,7 @@ def generate_messages(model, prompt):
         modal.Secret.from_name("srma-gemini"),
     ],
     memory=1024,
-    cpu=2.0,
+    cpu=4.0,
     timeout=600
 )
 async def gen(
@@ -809,8 +822,7 @@ class Abstract:
     def sample_abstract(self, actual_value, seed_generator, n=1):
 
         abstracts = (
-            self.generation_task.get_abstract_series(actual_value=actual_value)
-            .sample(n=n, random_state=seed_generator)
+            self.generation_task.get_abstracts(actual_value=actual_value, n=n, random_state=seed_generator)
             .tolist()
         )
 
@@ -818,15 +830,13 @@ class Abstract:
 
     def sample_cot_abstract(self, actual_value, seed_generator, n=1):
         searchable_abstracts = self.generation_task.get_cot_abstract_dataframe(
-            actual_value=actual_value
+            actual_value=actual_value, n=n, seed_generator=seed_generator
         )
         if len(searchable_abstracts) < n:
             raise ValueError(
                 f"Insufficient number of abstracts to sample from. {len(searchable_abstracts)} < {n}"
             )
-        abstracts = searchable_abstracts.sample(
-            n=n, random_state=seed_generator
-        ).to_dict("records")
+        abstracts = searchable_abstracts.to_dict("records")
 
         return abstracts
 
@@ -835,13 +845,9 @@ class Abstract:
             return
         self.actual_value = self.generation_task.consume()
         
-        if self.generation_task.abstract_in_investigation:
-            self.abstract = self.generation_task.abstract_in_investigation
-        # Get a random abstract
-        else:
-            self.abstract = self.sample_abstract(
-                self.actual_value, self.generation_task.seed_generator, n=1
-            )[0]
+        self.abstract = self.sample_abstract(
+            self.actual_value, self.generation_task.seed_generator, n=1
+        )[0]
 
         seed_generator_few_shot = self.generation_task.default_rng_few_shot()
 
