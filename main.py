@@ -195,12 +195,12 @@ class GenerationTask:
             return pd.Series([self.abstract_in_investigation])
         exclude = True if actual_value == "excluded" else False
         if exclude:
-            samples = self.excluded_abstracts.sample(n=n, random_state=random_state)
+            samples = self.excluded_abstracts.sample(n=n, random_state=random_state, replace=False)
             # Sample without replacement
             self.excluded_abstracts = self.excluded_abstracts.drop(samples.index)
             return samples
         else:
-            samples = self.included_abstracts.sample(n=n, random_state=random_state)
+            samples = self.included_abstracts.sample(n=n, random_state=random_state, replace=False)
             # Sample without replacement
             self.included_abstracts = self.included_abstracts.drop(samples.index)
             return samples
