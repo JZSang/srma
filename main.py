@@ -642,9 +642,9 @@ async def gen(
     import asyncio
     import logging
 
-    cot_vol.reload()
 
     ### SLOW Reading from disk
+    cot_vol.reload()
     generation_task.load_abstracts()
     generation_task.load_gpt_cot()
     generation_task.default_rng(seed)
@@ -1004,14 +1004,19 @@ def generate_unique_id():
 )
 def create_subsets():
     import os
-    import pandas as pd
+    
+    # Clean all generated files
+    remove_files.local()
 
+    # Find all relevant files in directory
     files = os.listdir(MOUNT_DIR)
     files = [file for file in files if file.endswith(".csv")]
 
     # split into train and test sets, use 800 for gptcot, 800 for train, 800 for validation, and the rest for testing
-    trues = list(create_subset.map(files))
-    print(trues, os.listdir(MOUNT_DIR))
+    _ = list(create_subset.map(files))
+    
+    vol.reload()
+    print(os.listdir(MOUNT_DIR))
     return True
 
 
@@ -1021,31 +1026,33 @@ def create_subsets():
 def create_subset(file):
     import os
     import pandas as pd
+    
+    split = 800
 
     print("Processing ", file)
     df = pd.read_csv(os.path.join(MOUNT_DIR, file), low_memory=False)
     # remove .csv from end of filename using os
     file = os.path.splitext(file)[0]
     
-    gptcot_set = df.sample(800)
+    gptcot_set = df.sample(split)
     df = df.drop(gptcot_set.index)
     
-    train = df.sample(800)
+    train = df.sample(split)
     df = df.drop(train.index)
     
-    validation = df.sample(800)
+    validation = df.sample(split)
     test = df.drop(validation.index)
     
-    gptcot_set.to_csv(os.path.join(MOUNT_DIR, f"{file}_gen_gpt_cot_800.csv"), index=False)
-    print("GPT CoT set saved as ", f"{file}_gen_gpt_cot_800.csv")
+    gptcot_set.to_csv(os.path.join(MOUNT_DIR, f"{file}_gen_gpt_cot_{split}.csv"), index=False)
+    print("GPT CoT set saved as ", f"{file}_gen_gpt_cot_{split}.csv")
     
-    train.to_csv(os.path.join(MOUNT_DIR, f"{file}_gen_train_800.csv"), index=False)
-    print("Train saved as ", f"{file}_gen_train_1000.csv")
+    train.to_csv(os.path.join(MOUNT_DIR, f"{file}_gen_train_{split}.csv"), index=False)
+    print("Train saved as ", f"{file}_gen_train_{split}.csv")
     
     validation.to_csv(
-        os.path.join(MOUNT_DIR, f"{file}_gen_validation_800.csv"), index=False
+        os.path.join(MOUNT_DIR, f"{file}_gen_validation_{split}.csv"), index=False
     )
-    print("Validation saved as ", f"{file}_gen_validation_800.csv")
+    print("Validation saved as ", f"{file}_gen_validation_{split}.csv")
     
     test.to_csv(os.path.join(MOUNT_DIR, f"{file}_gen_test.csv"), index=False)
     print("Test saved as ", f"{file}_gen_test.csv")
@@ -1053,20 +1060,19 @@ def create_subset(file):
     vol.commit()
     return True
 
-# @stub.function(
-#     volumes={MOUNT_DIR: vol},
-# )
-# def remove_files():
-#     import os
-#     import glob
-#     # glob pattern = *.csv_*
-#     glob_pattern = os.path.join(MOUNT_DIR, "*gen*")
-#     files = glob.glob(glob_pattern)
-#     print(files)
-#     for file in files:
-#         os.remove(os.path.join(MOUNT_DIR, file))
-#     vol.commit()
-#     return True
+@stub.function(
+    volumes={MOUNT_DIR: vol},
+)
+def remove_files():
+    import os
+    import glob
+    glob_pattern = os.path.join(MOUNT_DIR, "*gen*")
+    files = glob.glob(glob_pattern)
+    print(files)
+    for file in files:
+        os.remove(os.path.join(MOUNT_DIR, file))
+    vol.commit()
+    return True
 
 @stub.local_entrypoint()
 def main():
