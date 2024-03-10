@@ -315,9 +315,30 @@ class COTResult(BaseModel):
     test_abstract: str = ""
 
 
-@stub.function(timeout=600)
+@stub.function()
 @modal.web_endpoint(label="submit", method="POST")
 def f(item: Item):
+    call = run_f.spawn(item)
+    print("Starting run with ", call.object_id)
+    return {"function_id": call.object_id}
+    
+@stub.function()
+@modal.web_endpoint(label="check-test", method="GET")
+def check_test(function_id=None):
+    if not function_id:
+        raise ValueError("Invalid function_id")
+    run_f_function = modal.functions.FunctionCall.from_id(function_id)
+    try:
+        return run_f_function.get(timeout=0)
+    except TimeoutError:
+        return {"function_id": run_f_function.object_id}
+    except:
+        raise ValueError("Invalid state")
+    
+@stub.function(timeout=60*60)
+def run_f(item: Item):
+    import time
+    start_time = time.time()
     correct_count = 0
     completed_count = 0
     skipped_count = 0
@@ -379,6 +400,8 @@ def f(item: Item):
     stub.status_tracker[mode] = StatusTracker(mode)
     
     print("Completed, status: ", status_tracker.__dict__)
+    end_time = time.time()
+    print("Time taken: ", end_time - start_time)
 
     return {
         "results": results,
@@ -477,11 +500,14 @@ async def gptcot(item: COTItem):
             new_results,
             columns=["actual_value", "abstract", "chain_of_thought", "final_prompt"],
         )
+        number_used_included = len(df[df["actual_value"] == "included"])
+        number_used_excluded = len(df[df["actual_value"] == "excluded"])
         csv_file_path = f"{MOUNT_DIR_COT}/cot_{unique_id}.csv"
         df.to_csv(csv_file_path, index=True)
         cot_vol.commit()
+        return number_used_excluded, number_used_included
 
-    filter_and_save_results(unique_id, results)
+    number_used_excluded, number_used_included = filter_and_save_results(unique_id, results)
 
     print("Completed and saved as ", unique_id)
 
@@ -497,6 +523,8 @@ async def gptcot(item: COTItem):
         "id": unique_id,
         "include_dataset": item.include_dataset,
         "exclude_dataset": item.exclude_dataset,
+        "number_used_excluded": number_used_excluded,
+        "number_used_included": number_used_included,
     }
 
 
@@ -632,8 +660,8 @@ def generate_messages(model, prompt):
         modal.Secret.from_name("srma-gemini"),
     ],
     memory=1024,
-    cpu=4.0,
-    timeout=600
+    cpu=2.0,
+    timeout=60 * 60
 )
 async def gen(
     seed: int,
