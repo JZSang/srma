@@ -15,16 +15,16 @@ FINAL_PROMPT = "{preprompt}\n{few_shot_text}\n# Abstract in investigation: \n{te
 MAX_COMPLETION_TOKENS = 1536
 USAGE_LIMITS = {
     "gpt-3.5-turbo": {
-        "max_requests_per_minute": 500,
-        "max_tokens_per_minute": 60000,
+        "max_requests_per_minute": 5000,
+        "max_tokens_per_minute": 160000,
     },
     "gpt-4-0125-preview": {
-        "max_requests_per_minute": 500,
-        "max_tokens_per_minute": 300000,
+        "max_requests_per_minute": 5000,
+        "max_tokens_per_minute": 600000,
     },
     "gpt-3.5-turbo-0125": {
-        "max_requests_per_minute": 500,
-        "max_tokens_per_minute": 60000,
+        "max_requests_per_minute": 5000,
+        "max_tokens_per_minute": 160000,
     },
     "gemini-pro": {
         "max_requests_per_minute": 60,
