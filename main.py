@@ -3,28 +3,29 @@ import os
 import time
 from pydantic import BaseModel
 from dataclasses import dataclass, field
+from fastapi import UploadFile, File
 from typing import Union
 import asyncio
 import numpy as np
 
 # Constant texts
 FINAL_PROMPT = "{preprompt}\n{few_shot_text}\n# Abstract in investigation: \n{test_abstract}\n\n{prompt}\n"
-
+FILTER_EMPTY_COLUMNS = ["Abstract", "Content"]
 
 ### LLM SETTINGS
 MAX_COMPLETION_TOKENS = 1536
 USAGE_LIMITS = {
     "gpt-3.5-turbo": {
-        "max_requests_per_minute": 5000,
-        "max_tokens_per_minute": 160000,
+        "max_requests_per_minute": 10000,
+        "max_tokens_per_minute": 2000000,
     },
     "gpt-4-0125-preview": {
-        "max_requests_per_minute": 5000,
-        "max_tokens_per_minute": 600000,
+        "max_requests_per_minute": 10000,
+        "max_tokens_per_minute": 1500000,
     },
     "gpt-3.5-turbo-0125": {
-        "max_requests_per_minute": 5000,
-        "max_tokens_per_minute": 160000,
+        "max_requests_per_minute": 10000,
+        "max_tokens_per_minute": 2000000,
     },
     "gemini-pro": {
         "max_requests_per_minute": 60,
@@ -38,14 +39,18 @@ TEXT_SEED = 1337
 WORKSPACE = "jzsang"
 
 ### Raw dataset storage
-vol = modal.Volume.persisted("srma")
+# vol_dataset = modal.Volume.persisted("srma")
+vol_dataset = modal.Volume.persisted("srma-dataset")
 MOUNT_DIR = "/data"
-EXCLUDED_ABSTRACTS = "review_2821_irrelevant_csv_20240130175158.csv"
-INCLUDED_ABSTRACTS = "review_2821_included_csv_20240127132513.csv"
+EXCLUDED_ABSTRACTS = "excl_final.csv"
+INCLUDED_ABSTRACTS = "incl_final.csv"
+
 
 ### GPTCoT storage
 MOUNT_DIR_COT = "/cot"
 cot_vol = modal.Volume.persisted("srma-cot")
+
+vol_save_results = modal.Volume.persisted("srma-results")
 
 
 ### MODAL INITIALIZERS
@@ -63,6 +68,169 @@ stub.cot_result_queue = modal.Queue.new()
 ### Process status tracker
 stub.status_tracker = modal.Dict.new()
 
+stub.file_lock = modal.Dict.new()
+stub.file_metadata_queue = modal.Queue.new()
+class Metadata(BaseModel):
+    lines: int
+    size: int
+    columns: list[str]
+    filtered: bool
+    file: str
+    deleted: bool
+    original_file: str
+    split_type: str
+
+@stub.function(volumes={MOUNT_DIR: vol_dataset})
+@modal.web_endpoint(label="dataset-upload", method="POST")
+async def dataset_upload(file: UploadFile = File(...)):
+    if file.content_type != "text/csv":
+        raise ValueError("File must be a CSV")
+    
+    import pandas as pd
+    import numpy as np
+    from io import StringIO
+    
+    # 1. Save the file
+    content = await file.read()
+    data = content.decode("utf-8")
+    df = pd.read_csv(StringIO(data), low_memory=False)
+    df = df.fillna(np.nan)
+    for col in FILTER_EMPTY_COLUMNS:
+        if col in df.columns:
+            df = df.dropna(subset=[col])
+    df.to_csv(os.path.join(MOUNT_DIR, file.filename), index=False)
+    
+    # Add metadata to be saved into a queue. Will call on page load.
+    info = Metadata(split_type="Raw", lines=len(df), size=os.path.getsize(os.path.join(MOUNT_DIR, file.filename)), columns=list(df.columns), filtered=False, file=file.filename, deleted=False, original_file=file.filename)
+    stub.file_metadata_queue.put(info)
+    
+    # 2. Commit
+    vol_dataset.commit()
+    
+    # 3. Show preview
+    return info
+
+class DatasetManage(BaseModel):
+    type: str = "ls"
+    file: str = None
+    files: list[str] = None
+    
+    column: str = None
+    
+    splits: tuple[int, int, int, int] = None
+
+
+@stub.function(volumes={MOUNT_DIR: vol_dataset})
+@modal.web_endpoint(label="dataset-manage", method="POST")
+async def dataset_manage(params: DatasetManage):
+    # Pause operation until lock is released
+    while stub.file_lock.get("lock", False):
+        await asyncio.sleep(0.1)
+    stub.file_lock["lock"] = True
+    try: 
+        ret = await dataset_manage_impl(params)
+    finally:
+        stub.file_lock["lock"] = False
+    return ret
+
+async def dataset_manage_impl(params: DatasetManage):
+    if params.type == "delete":
+        if not params.files:
+            return True
+        import os
+        for file in params.files:
+            os.remove(os.path.join(MOUNT_DIR, file))
+            # Make sure there's if statement to check deleted
+            # Make sure that deleted instances throw an error
+            stub.file_metadata_queue.put(Metadata(split_type="Raw", lines=0, size=0, columns=[], filtered=False, file=file, deleted=True, original_file=file))
+        vol_dataset.commit()
+
+        return True
+    elif params.type == "ls":
+        import os
+        files: list[Metadata] = stub.file_metadata_queue.get_many(9999, block=False)
+        if files:
+            vol_dataset.reload()
+            with open(os.path.join(MOUNT_DIR, "metadata.json"), 'r') as f:
+                import json
+                data = json.load(f)
+            with open(os.path.join(MOUNT_DIR, "metadata.json"), 'w') as f:
+                for file in files:
+                    if file.deleted:
+                        del data[file.file]
+                        continue
+                    data[file.file] = file.dict()
+                json.dump(data, f)
+                
+            vol_dataset.commit()
+        with open(os.path.join(MOUNT_DIR, "metadata.json"), 'r') as f:
+            import json
+            content = json.load(f)
+            return [content[file] for file in sorted(content.keys())]
+        
+    elif params.type == "filter_na":
+        import pandas as pd
+        vol_dataset.reload()
+        df = pd.read_csv(os.path.join(MOUNT_DIR, params.file))
+        df = df.dropna(subset=[params.column])
+        df.to_csv(os.path.join(MOUNT_DIR, params.file), index=False)
+        
+        stub.file_metadata_queue.put(Metadata(lines=len(df), size=os.path.getsize(os.path.join(MOUNT_DIR, params.file)), columns=list(df.columns), filtered=True, file=params.file, deleted=False, original_file=params.file))
+        
+        vol_dataset.commit()
+        return {"remaining_empty": df[params.column].isna().sum()}
+    
+    elif params.type == "split":
+        import pandas as pd
+        import numpy as np
+        import os
+        np.random.seed(1337)
+        
+        # validate
+        gptcot, train, val, test = params.splits
+        
+        vol_dataset.reload()
+        df = pd.read_csv(os.path.join(MOUNT_DIR, params.file), low_memory=False)
+        if gptcot + train + val + test != len(df):
+            raise ValueError("Invalid split sizes")
+        
+        
+        # create dataframe splits
+        df_gptcot = df.sample(gptcot)
+        df = df.drop(df_gptcot.index)
+        
+        df_train = df.sample(train)
+        df = df.drop(df_train.index)
+        
+        df_val = df.sample(val)
+        df = df.drop(df_val.index)
+        
+        df_test = df.sample(test)
+        df = df.drop(df_test.index)
+        
+        filename = os.path.splitext(params.file)[0]
+        
+        # save to disk
+        gptcot_filename = f"{filename}_gen_{gptcot}_gptcot.csv"
+        train_filename = f"{filename}_gen_{train}_train.csv"
+        val_filename = f"{filename}_gen_{val}_val.csv"
+        test_filename = f"{filename}_gen_{test}_test.csv"
+        df_gptcot.to_csv(os.path.join(MOUNT_DIR, gptcot_filename), index=False)
+        df_train.to_csv(os.path.join(MOUNT_DIR, train_filename), index=False)
+        df_val.to_csv(os.path.join(MOUNT_DIR, val_filename), index=False)
+        df_test.to_csv(os.path.join(MOUNT_DIR, test_filename), index=False)
+
+        # generate metadata
+        info_gptcot = Metadata(split_type="GPTCoT", lines=len(df_gptcot), size=os.path.getsize(os.path.join(MOUNT_DIR, gptcot_filename)), columns=list(df_gptcot.columns), filtered=True, file=gptcot_filename, deleted=False, original_file=params.file)
+        info_train = Metadata(split_type="Train", lines=len(df_train), size=os.path.getsize(os.path.join(MOUNT_DIR, train_filename)), columns=list(df_train.columns), filtered=True, file=train_filename, deleted=False, original_file=params.file)
+        info_val = Metadata(split_type="Validation", lines=len(df_val), size=os.path.getsize(os.path.join(MOUNT_DIR, val_filename)), columns=list(df_val.columns), filtered=True, file=val_filename, deleted=False, original_file=params.file)
+        info_test = Metadata(split_type="Test", lines=len(df_test), size=os.path.getsize(os.path.join(MOUNT_DIR, test_filename)), columns=list(df_test.columns), filtered=True, file=test_filename, deleted=False, original_file=params.file)
+        stub.file_metadata_queue.put_many([info_gptcot, info_train, info_val, info_test])
+        
+        # commit to disk
+        vol_dataset.commit()
+
+        return {"gptcot": len(df_gptcot), "train": len(df_train), "val": len(df_val), "test": len(df_test)}
 
 @stub.function()
 @modal.web_endpoint(label="status", method="GET")
@@ -181,11 +349,18 @@ class GenerationTask:
         df_excluded = pd.read_csv(
             os.path.join("/data", self.exclude_dataset), keep_default_na=False
         )
-        excluded_abstracts = df_excluded["Abstract"].replace("", np.nan).dropna()
+        if "Abstract" in df_excluded.columns:
+            excluded_abstracts = df_excluded["Abstract"].replace("", np.nan).dropna()
+        else:
+            excluded_abstracts = df_excluded["Content"].replace("", np.nan).dropna()
+        
         df_included = pd.read_csv(
             os.path.join("/data", self.include_dataset), keep_default_na=False
         )
-        included_abstracts = df_included["Abstract"].replace("", np.nan).dropna()
+        if "Abstract" in df_included.columns:
+            included_abstracts = df_included["Abstract"].replace("", np.nan).dropna()
+        else:
+            included_abstracts = df_included["Content"].replace("", np.nan).dropna()
         self.excluded_abstracts = excluded_abstracts
         self.included_abstracts = included_abstracts
 
@@ -335,7 +510,7 @@ def check_test(function_id=None):
     except:
         raise ValueError("Invalid state")
     
-@stub.function(timeout=60*60)
+@stub.function(timeout=60*60, volumes={MOUNT_DIR: vol_save_results})
 def run_f(item: Item):
     import time
     start_time = time.time()
@@ -402,8 +577,8 @@ def run_f(item: Item):
     print("Completed, status: ", status_tracker.__dict__)
     end_time = time.time()
     print("Time taken: ", end_time - start_time)
-
-    return {
+    
+    results = {
         "results": results,
         "total_correct": correct_count,
         "total": completed_count,
@@ -414,6 +589,14 @@ def run_f(item: Item):
         "few_shot_exclude": item.few_shot_exclude,
         "few_shot_include": item.few_shot_include,
     }
+    
+    # Save asynchronously based on time because we want to return from webpoint immediately
+    with open(os.path.join(MOUNT_DIR, f"results_{end_time}.json"), 'w') as f:
+        import json
+        json.dump(results, f)
+    vol_save_results.commit()
+
+    return results
 
 
 @stub.function(volumes={MOUNT_DIR_COT: cot_vol}, timeout=600)
@@ -654,7 +837,7 @@ def generate_messages(model, prompt):
 
 
 @stub.function(
-    volumes={MOUNT_DIR: vol, MOUNT_DIR_COT: cot_vol},
+    volumes={MOUNT_DIR: vol_dataset, MOUNT_DIR_COT: cot_vol},
     secrets=[
         modal.Secret.from_name("srma-openai"),
         modal.Secret.from_name("srma-gemini"),
@@ -688,7 +871,7 @@ async def gen(
         30 if generation_task.model == "gemini-pro" else 15
     )
     seconds_to_sleep_each_loop = (
-        0.001  # 1 ms limits max throughput to 1,000 requests per second
+        0.01  # 10 ms limits max throughput to 100 requests per second
     )
     queue_of_requests_to_retry = asyncio.Queue()
     task_id_generator = task_id_generator_function()
@@ -788,17 +971,18 @@ async def gen(
     return 1
 
 
-@stub.function(
-    volumes={MOUNT_DIR: vol},
-)
-@modal.web_endpoint(label="ls", method="GET")
-def ls():
-    import glob
+# @stub.function(
+#     volumes={MOUNT_DIR: vol},
+# )
+# @modal.web_endpoint(label="ls", method="GET")
+# def ls():
+#     vol.reload()
+#     import glob
 
-    return [
-        {"name": os.path.basename(file), "size": os.path.getsize(file)}
-        for file in glob.glob(f"{MOUNT_DIR}/*.csv")
-    ]
+#     return [
+#         {"name": os.path.basename(file), "size": os.path.getsize(file)}
+#         for file in glob.glob(f"{MOUNT_DIR}/*.csv")
+#     ]
 
 
 ### PARALLEL PROCESSING HELPERS ##########################################
@@ -1028,7 +1212,7 @@ def generate_unique_id():
 
 
 @stub.function(
-    volumes={MOUNT_DIR: vol},
+    volumes={MOUNT_DIR: vol_dataset},
 )
 def create_subsets():
     import os
@@ -1043,32 +1227,49 @@ def create_subsets():
     # split into train and test sets, use 800 for gptcot, 800 for train, 800 for validation, and the rest for testing
     _ = list(create_subset.map(files))
     
-    vol.reload()
+    vol_dataset.reload()
     print(os.listdir(MOUNT_DIR))
     return True
 
 
 @stub.function(
-    volumes={MOUNT_DIR: vol},
+    volumes={MOUNT_DIR: vol_dataset},
 )
 def create_subset(file):
     import os
     import pandas as pd
+    import random
+    random.seed(1337)
     
-    split = 800
 
     print("Processing ", file)
     df = pd.read_csv(os.path.join(MOUNT_DIR, file), low_memory=False)
     # remove .csv from end of filename using os
     file = os.path.splitext(file)[0]
+    split = min(800, (len(df) - 400)//3)
     
-    gptcot_set = df.sample(split)
+    if split < 800:
+        split = len(df)//2
+        
+        train = df.sample(split, random_state=1337)
+        test = df.drop(train.index)
+        
+        train.to_csv(os.path.join(MOUNT_DIR, f"{file}_gen_train_{split}.csv"), index=False)
+        print("Train saved as ", f"{file}_gen_train_{split}.csv")
+        
+        test.to_csv(os.path.join(MOUNT_DIR, f"{file}_gen_test.csv"), index=False)
+        print("Test saved as ", f"{file}_gen_test.csv")
+        
+        vol_dataset.commit()
+        return True
+    
+    gptcot_set = df.sample(split, random_state=1337)
     df = df.drop(gptcot_set.index)
     
-    train = df.sample(split)
+    train = df.sample(split, random_state=1337)
     df = df.drop(train.index)
     
-    validation = df.sample(split)
+    validation = df.sample(split, random_state=1337)
     test = df.drop(validation.index)
     
     gptcot_set.to_csv(os.path.join(MOUNT_DIR, f"{file}_gen_gpt_cot_{split}.csv"), index=False)
@@ -1085,11 +1286,11 @@ def create_subset(file):
     test.to_csv(os.path.join(MOUNT_DIR, f"{file}_gen_test.csv"), index=False)
     print("Test saved as ", f"{file}_gen_test.csv")
     
-    vol.commit()
+    vol_dataset.commit()
     return True
 
 @stub.function(
-    volumes={MOUNT_DIR: vol},
+    volumes={MOUNT_DIR: vol_dataset},
 )
 def remove_files():
     import os
@@ -1099,7 +1300,7 @@ def remove_files():
     print(files)
     for file in files:
         os.remove(os.path.join(MOUNT_DIR, file))
-    vol.commit()
+    vol_dataset.commit()
     return True
 
 @stub.local_entrypoint()
