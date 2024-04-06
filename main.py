@@ -13,7 +13,7 @@ FINAL_PROMPT = "{preprompt}\n{few_shot_text}\n# Abstract in investigation: \n{te
 FILTER_EMPTY_COLUMNS = ["Abstract", "Content"]
 
 ### LLM SETTINGS
-MAX_COMPLETION_TOKENS = 1536
+MAX_COMPLETION_TOKENS = 2048
 USAGE_LIMITS = {
     "gpt-3.5-turbo": {
         "max_requests_per_minute": 10000,
@@ -270,12 +270,12 @@ class GenerationTask:
     ):
         self.mode = mode
         if mode == "test":
-            self.result_queue = stub.result_queue
+            self.result_queue = []
             print(
                 f"Running test mode with {num_excluded_abstracts} excluded abstracts and {num_included_abstracts} included abstracts"
             )
         elif mode == "gptcot":
-            self.result_queue = stub.cot_result_queue
+            self.result_queue = []
             print(
                 f"Running gptcot mode with {num_excluded_abstracts} excluded abstracts and {num_included_abstracts} included abstracts"
             )
@@ -288,8 +288,8 @@ class GenerationTask:
         else:
             raise ValueError(f"Invalid mode {mode}")
         # Clear the persisted queue
-        self.result_queue.get_many(stub.result_queue.len(), block=False)
-        assert self.result_queue.len() == 0
+        self.get_all_result_queue()
+        assert self.length_result_queue() == 0
 
         if abstract_in_investigation and abstract_in_investigation_actual_value:
             self.abstract_in_investigation = abstract_in_investigation
@@ -340,10 +340,22 @@ class GenerationTask:
     def needs_append_few_shots(self):
         return self.few_shot_exclude or self.few_shot_include
 
+    def put_result_queue(self, result):
+        self.result_queue.append(result)
+        
+    def get_all_result_queue(self):
+        return self.result_queue
+
+    def length_result_queue(self):
+        return len(self.result_queue)
+
     def load_abstracts(self):
         import pandas as pd
         import os
         import numpy as np
+        
+        if "seed_generator" not in self.__dict__: 
+            raise ValueError("seed_generator not set")
 
         # Load up volume files in memory
         df_excluded = pd.read_csv(
@@ -361,10 +373,23 @@ class GenerationTask:
             included_abstracts = df_included["Abstract"].replace("", np.nan).dropna()
         else:
             included_abstracts = df_included["Content"].replace("", np.nan).dropna()
-        self.excluded_abstracts = excluded_abstracts
-        self.included_abstracts = included_abstracts
+        self.excluded_abstracts = excluded_abstracts.sample(frac=1, random_state=self.seed_generator)
+        self.included_abstracts = included_abstracts.sample(frac=1, random_state=self.seed_generator)
+        self.get_next_abstract_excluded = self.get_next_abstract_generator(True)
+        self.get_next_abstract_included = self.get_next_abstract_generator(False) 
+        
+    # generator
+    def get_next_abstract_generator(self, exclude):
+        if exclude:
+            for abstract in self.excluded_abstracts:
+                yield abstract
+        elif not exclude:
+            for abstract in self.included_abstracts:
+                yield abstract
+        else:
+            raise ValueError(f"Invalid actual_value excluded={exclude}, this should never happen")
 
-    def get_abstracts(self, actual_value="excluded", n=1, random_state=None):
+    def get_abstracts(self, actual_value="excluded", n=1, random_state=None, mode="testset"):
         if self.abstract_in_investigation:
             import pandas as pd
             return pd.Series([self.abstract_in_investigation])
@@ -412,21 +437,25 @@ class GenerationTask:
     def default_rng(self, seed):
         self.seed_generator = np.random.default_rng(seed)
 
-    def default_rng_few_shot(self):
+    def new_default_rng(self):
         """
-        Used to ensure few_shot generation is consistent across runs
+        Used to ensure generation is consistent across runs for subtree operations
         """
         return np.random.default_rng(self.seed_generator.integers(0, 2**32 - 1))
 
     def check_completion(self):
         # Currently, failures not thrown during text generation do not stop execution.
-        if self.result_queue.len() != self.total:
+        if self.length_result_queue() != self.total:
             print("ERROR ### result_queue.len() != self.total, returning what's left anyways")
 
     def cleanup(self):
         self.excluded_abstracts = None
         self.included_abstracts = None
         self.gpt_cot = None
+        # remove all generators because they cannot be pickled
+        self.get_next_abstract_excluded = None
+        self.get_next_abstract_included = None
+        
 
 class KillException(Exception):
     pass
@@ -475,6 +504,8 @@ class Result(BaseModel):
     predicted_value: Union[str, None] = ""
     actual_value: str = ""
     test_abstract: str = ""
+    
+    token_counts: dict = {}
 
 
 class COTResult(BaseModel):
@@ -510,7 +541,7 @@ def check_test(function_id=None):
     except:
         raise ValueError("Invalid state")
     
-@stub.function(timeout=60*60, volumes={MOUNT_DIR: vol_save_results})
+@stub.function(timeout=60*60)
 def run_f(item: Item):
     import time
     start_time = time.time()
@@ -541,7 +572,7 @@ def run_f(item: Item):
     )
 
     try:
-        gen.remote(
+        generation_task = gen.remote(
             item.seed,
             generation_task,
         )
@@ -549,8 +580,8 @@ def run_f(item: Item):
         stub.status_tracker[mode + "kill"] = False
 
     generation_task.check_completion()
-
-    for res in stub.result_queue.get_many(total_prompts, block=False):
+    import tiktoken
+    for res in generation_task.get_all_result_queue():
         if res["skipped"]:
             skipped_count += 1
         else:
@@ -558,16 +589,21 @@ def run_f(item: Item):
                 correct_count += 1
             completed_count += 1
 
+        encoding = tiktoken.get_encoding(TOKENIZER)
+        
+        llm_answer = res.get("llm_answer") or ""
+        token_counts = {"llm_answer": len(encoding.encode(llm_answer)), "prompt": len(encoding.encode(res["prompt"]))}
         results.append(
             Result(
                 prompt=res["prompt"],
-                llm_answer=res.get("llm_answer"),
+                llm_answer=llm_answer,
                 correct=res["correct"],
                 skipped=res["skipped"],
                 predicted_value=res["predicted_value"],
                 actual_value=res["actual_value"],
                 error=str(res["error"]) if res["skipped"] else None,
                 test_abstract=res["test_abstract"],
+                token_counts=token_counts
             )
         )
 
@@ -578,7 +614,8 @@ def run_f(item: Item):
     end_time = time.time()
     print("Time taken: ", end_time - start_time)
     
-    results = {
+    final_results = {
+        "model": item.model,
         "results": results,
         "total_correct": correct_count,
         "total": completed_count,
@@ -590,14 +627,17 @@ def run_f(item: Item):
         "few_shot_include": item.few_shot_include,
     }
     
-    # Save asynchronously based on time because we want to return from webpoint immediately
-    with open(os.path.join(MOUNT_DIR, f"results_{end_time}.json"), 'w') as f:
+    save_final_results.spawn(final_results, time=int(time.time()))
+
+    return final_results
+
+@stub.function(volumes={MOUNT_DIR: vol_save_results})
+async def save_final_results(final_results, time):
+    final_results["results"] = [result.dict() for result in final_results["results"]]
+    with open(os.path.join(MOUNT_DIR, f"results_{time}.json"), 'w') as f:
         import json
-        json.dump(results, f)
+        json.dump(final_results, f)
     vol_save_results.commit()
-
-    return results
-
 
 @stub.function(volumes={MOUNT_DIR_COT: cot_vol}, timeout=600)
 @modal.web_endpoint(label="gptcot", method="POST")
@@ -627,7 +667,7 @@ async def gptcot(item: COTItem):
     )
 
     try:
-        gen.remote(
+        generation_task = gen.remote(
             item.seed,
             generation_task,
         )
@@ -636,7 +676,7 @@ async def gptcot(item: COTItem):
 
     generation_task.check_completion()
 
-    for res in generation_task.result_queue.get_many(total_prompts, block=False):
+    for res in generation_task.get_all_result_queue():
         if res["skipped"]:
             skipped_count += 1
         else:
@@ -807,6 +847,8 @@ def calculate_tokens(model, prompt, max_token_response):
 
 
 def is_excluded(text, test_abstract):
+    if text is None:
+        raise Exception(f"Invalid case: LLM did not print an answer: {test_abstract}")
     # search area to the very end, maybe about 100 characters
     text = text[-100:]
     if "XXX" in text and "YYY" in text:
@@ -856,9 +898,9 @@ async def gen(
 
     ### SLOW Reading from disk
     cot_vol.reload()
+    generation_task.default_rng(seed)
     generation_task.load_abstracts()
     generation_task.load_gpt_cot()
-    generation_task.default_rng(seed)
     ### SLOW Reading from disk
 
     # initialize logging
@@ -871,7 +913,7 @@ async def gen(
         30 if generation_task.model == "gemini-pro" else 15
     )
     seconds_to_sleep_each_loop = (
-        0.01  # 10 ms limits max throughput to 100 requests per second
+        0.007  # 7 ms limits max throughput to 142 requests per second
     )
     queue_of_requests_to_retry = asyncio.Queue()
     task_id_generator = task_id_generator_function()
@@ -968,7 +1010,7 @@ async def gen(
     stub.status_tracker[generation_task.mode] = status_tracker
 
     generation_task.cleanup()
-    return 1
+    return generation_task
 
 
 # @stub.function(
@@ -1031,11 +1073,10 @@ class Abstract:
     token_consumption: int = 0
     abstract: str = ""
 
-    def sample_abstract(self, actual_value, seed_generator, n=1):
+    def sample_abstract(self, actual_value, seed_generator, mode, n=1):
 
         abstracts = (
-            self.generation_task.get_abstracts(actual_value=actual_value, n=n, random_state=seed_generator)
-            .tolist()
+            self.generation_task.get_abstracts(actual_value=actual_value, n=n, random_state=seed_generator, mode=mode)
         )
 
         return abstracts
@@ -1057,24 +1098,26 @@ class Abstract:
             return
         self.actual_value = self.generation_task.consume()
         
-        self.abstract = self.sample_abstract(
-            self.actual_value, self.generation_task.seed_generator, n=1
-        )[0]
+        if self.actual_value == "excluded":
+            self.abstract = next(self.generation_task.get_next_abstract_excluded)
+        else:
+            self.abstract = next(self.generation_task.get_next_abstract_included)
 
-        seed_generator_few_shot = self.generation_task.default_rng_few_shot()
+        seed_generator_few_shot = self.generation_task.new_default_rng()
 
         few_shot_text = ""
         if self.generation_task.needs_append_few_shots():
             if not self.generation_task.is_generated_few_shot():
+                raise ValueError("do not use this type of few shot anymore, use cot in some form")
                 few_shot_text += "\n# Start of Examples\n"
                 number_include = self.generation_task.few_shot_include
                 number_exclude = self.generation_task.few_shot_exclude
 
                 few_shot_exclusionary_abstracts = self.sample_abstract(
-                    "excluded", seed_generator_few_shot, n=number_exclude
+                    "excluded", seed_generator_few_shot, n=number_exclude, mode="fewshot"
                 )
                 few_shot_inclusionary_abstracts = self.sample_abstract(
-                    "included", seed_generator_few_shot, n=number_include
+                    "included", seed_generator_few_shot, n=number_include, mode="fewshot"
                 )
 
                 for abstract in few_shot_exclusionary_abstracts:
@@ -1164,7 +1207,7 @@ class Abstract:
             if self.attempts_left:
                 retry_queue.put_nowait(self)
             else:
-                self.generation_task.result_queue.put(
+                self.generation_task.put_result_queue(
                     {
                         "skipped": True,
                         "prompt": self.final_prompt,
@@ -1178,7 +1221,7 @@ class Abstract:
                 )
                 status_tracker.fail()
         else:
-            self.generation_task.result_queue.put(
+            self.generation_task.put_result_queue(
                 {
                     "skipped": False,
                     "prompt": self.final_prompt,
