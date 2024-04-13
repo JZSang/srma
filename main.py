@@ -23,6 +23,10 @@ USAGE_LIMITS = {
         "max_requests_per_minute": 10000,
         "max_tokens_per_minute": 1500000,
     },
+    "gpt-4-turbo-2024-04-09": {
+        "max_requests_per_minute": 10000,
+        "max_tokens_per_minute": 1500000,
+    },
     "gpt-3.5-turbo-0125": {
         "max_requests_per_minute": 10000,
         "max_tokens_per_minute": 2000000,
@@ -70,6 +74,8 @@ stub.status_tracker = modal.Dict.new()
 
 stub.file_lock = modal.Dict.new()
 stub.file_metadata_queue = modal.Queue.new()
+
+
 class Metadata(BaseModel):
     lines: int
     size: int
@@ -80,16 +86,17 @@ class Metadata(BaseModel):
     original_file: str
     split_type: str
 
+
 @stub.function(volumes={MOUNT_DIR: vol_dataset})
 @modal.web_endpoint(label="dataset-upload", method="POST")
 async def dataset_upload(file: UploadFile = File(...)):
     if file.content_type != "text/csv":
         raise ValueError("File must be a CSV")
-    
+
     import pandas as pd
     import numpy as np
     from io import StringIO
-    
+
     # 1. Save the file
     content = await file.read()
     data = content.decode("utf-8")
@@ -99,24 +106,34 @@ async def dataset_upload(file: UploadFile = File(...)):
         if col in df.columns:
             df = df.dropna(subset=[col])
     df.to_csv(os.path.join(MOUNT_DIR, file.filename), index=False)
-    
+
     # Add metadata to be saved into a queue. Will call on page load.
-    info = Metadata(split_type="Raw", lines=len(df), size=os.path.getsize(os.path.join(MOUNT_DIR, file.filename)), columns=list(df.columns), filtered=False, file=file.filename, deleted=False, original_file=file.filename)
+    info = Metadata(
+        split_type="Raw",
+        lines=len(df),
+        size=os.path.getsize(os.path.join(MOUNT_DIR, file.filename)),
+        columns=list(df.columns),
+        filtered=False,
+        file=file.filename,
+        deleted=False,
+        original_file=file.filename,
+    )
     stub.file_metadata_queue.put(info)
-    
+
     # 2. Commit
     vol_dataset.commit()
-    
+
     # 3. Show preview
     return info
+
 
 class DatasetManage(BaseModel):
     type: str = "ls"
     file: str = None
     files: list[str] = None
-    
+
     column: str = None
-    
+
     splits: tuple[int, int, int, int] = None
 
 
@@ -127,89 +144,116 @@ async def dataset_manage(params: DatasetManage):
     while stub.file_lock.get("lock", False):
         await asyncio.sleep(0.1)
     stub.file_lock["lock"] = True
-    try: 
+    try:
         ret = await dataset_manage_impl(params)
     finally:
         stub.file_lock["lock"] = False
     return ret
+
 
 async def dataset_manage_impl(params: DatasetManage):
     if params.type == "delete":
         if not params.files:
             return True
         import os
+
         for file in params.files:
             os.remove(os.path.join(MOUNT_DIR, file))
             # Make sure there's if statement to check deleted
             # Make sure that deleted instances throw an error
-            stub.file_metadata_queue.put(Metadata(split_type="Raw", lines=0, size=0, columns=[], filtered=False, file=file, deleted=True, original_file=file))
+            stub.file_metadata_queue.put(
+                Metadata(
+                    split_type="Raw",
+                    lines=0,
+                    size=0,
+                    columns=[],
+                    filtered=False,
+                    file=file,
+                    deleted=True,
+                    original_file=file,
+                )
+            )
         vol_dataset.commit()
 
         return True
     elif params.type == "ls":
         import os
+
         files: list[Metadata] = stub.file_metadata_queue.get_many(9999, block=False)
         if files:
             vol_dataset.reload()
-            with open(os.path.join(MOUNT_DIR, "metadata.json"), 'r') as f:
+            with open(os.path.join(MOUNT_DIR, "metadata.json"), "r") as f:
                 import json
+
                 data = json.load(f)
-            with open(os.path.join(MOUNT_DIR, "metadata.json"), 'w') as f:
+            with open(os.path.join(MOUNT_DIR, "metadata.json"), "w") as f:
                 for file in files:
                     if file.deleted:
                         del data[file.file]
                         continue
                     data[file.file] = file.dict()
                 json.dump(data, f)
-                
+
             vol_dataset.commit()
-        with open(os.path.join(MOUNT_DIR, "metadata.json"), 'r') as f:
+        with open(os.path.join(MOUNT_DIR, "metadata.json"), "r") as f:
             import json
+
             content = json.load(f)
             return [content[file] for file in sorted(content.keys())]
-        
+
     elif params.type == "filter_na":
         import pandas as pd
+
         vol_dataset.reload()
         df = pd.read_csv(os.path.join(MOUNT_DIR, params.file))
         df = df.dropna(subset=[params.column])
         df.to_csv(os.path.join(MOUNT_DIR, params.file), index=False)
-        
-        stub.file_metadata_queue.put(Metadata(lines=len(df), size=os.path.getsize(os.path.join(MOUNT_DIR, params.file)), columns=list(df.columns), filtered=True, file=params.file, deleted=False, original_file=params.file))
-        
+
+        stub.file_metadata_queue.put(
+            Metadata(
+                lines=len(df),
+                size=os.path.getsize(os.path.join(MOUNT_DIR, params.file)),
+                columns=list(df.columns),
+                filtered=True,
+                file=params.file,
+                deleted=False,
+                original_file=params.file,
+            )
+        )
+
         vol_dataset.commit()
         return {"remaining_empty": df[params.column].isna().sum()}
-    
+
     elif params.type == "split":
         import pandas as pd
         import numpy as np
         import os
+
         np.random.seed(1337)
-        
+
         # validate
         gptcot, train, val, test = params.splits
-        
+
         vol_dataset.reload()
         df = pd.read_csv(os.path.join(MOUNT_DIR, params.file), low_memory=False)
         if gptcot + train + val + test != len(df):
             raise ValueError("Invalid split sizes")
-        
-        
+
         # create dataframe splits
         df_gptcot = df.sample(gptcot)
         df = df.drop(df_gptcot.index)
-        
+
         df_train = df.sample(train)
         df = df.drop(df_train.index)
-        
+
         df_val = df.sample(val)
         df = df.drop(df_val.index)
-        
+
         df_test = df.sample(test)
         df = df.drop(df_test.index)
-        
+
         filename = os.path.splitext(params.file)[0]
-        
+
         # save to disk
         gptcot_filename = f"{filename}_gen_{gptcot}_gptcot.csv"
         train_filename = f"{filename}_gen_{train}_train.csv"
@@ -221,21 +265,66 @@ async def dataset_manage_impl(params: DatasetManage):
         df_test.to_csv(os.path.join(MOUNT_DIR, test_filename), index=False)
 
         # generate metadata
-        info_gptcot = Metadata(split_type="GPTCoT", lines=len(df_gptcot), size=os.path.getsize(os.path.join(MOUNT_DIR, gptcot_filename)), columns=list(df_gptcot.columns), filtered=True, file=gptcot_filename, deleted=False, original_file=params.file)
-        info_train = Metadata(split_type="Train", lines=len(df_train), size=os.path.getsize(os.path.join(MOUNT_DIR, train_filename)), columns=list(df_train.columns), filtered=True, file=train_filename, deleted=False, original_file=params.file)
-        info_val = Metadata(split_type="Validation", lines=len(df_val), size=os.path.getsize(os.path.join(MOUNT_DIR, val_filename)), columns=list(df_val.columns), filtered=True, file=val_filename, deleted=False, original_file=params.file)
-        info_test = Metadata(split_type="Test", lines=len(df_test), size=os.path.getsize(os.path.join(MOUNT_DIR, test_filename)), columns=list(df_test.columns), filtered=True, file=test_filename, deleted=False, original_file=params.file)
-        stub.file_metadata_queue.put_many([info_gptcot, info_train, info_val, info_test])
-        
+        info_gptcot = Metadata(
+            split_type="GPTCoT",
+            lines=len(df_gptcot),
+            size=os.path.getsize(os.path.join(MOUNT_DIR, gptcot_filename)),
+            columns=list(df_gptcot.columns),
+            filtered=True,
+            file=gptcot_filename,
+            deleted=False,
+            original_file=params.file,
+        )
+        info_train = Metadata(
+            split_type="Train",
+            lines=len(df_train),
+            size=os.path.getsize(os.path.join(MOUNT_DIR, train_filename)),
+            columns=list(df_train.columns),
+            filtered=True,
+            file=train_filename,
+            deleted=False,
+            original_file=params.file,
+        )
+        info_val = Metadata(
+            split_type="Validation",
+            lines=len(df_val),
+            size=os.path.getsize(os.path.join(MOUNT_DIR, val_filename)),
+            columns=list(df_val.columns),
+            filtered=True,
+            file=val_filename,
+            deleted=False,
+            original_file=params.file,
+        )
+        info_test = Metadata(
+            split_type="Test",
+            lines=len(df_test),
+            size=os.path.getsize(os.path.join(MOUNT_DIR, test_filename)),
+            columns=list(df_test.columns),
+            filtered=True,
+            file=test_filename,
+            deleted=False,
+            original_file=params.file,
+        )
+        stub.file_metadata_queue.put_many(
+            [info_gptcot, info_train, info_val, info_test]
+        )
+
         # commit to disk
         vol_dataset.commit()
 
-        return {"gptcot": len(df_gptcot), "train": len(df_train), "val": len(df_val), "test": len(df_test)}
+        return {
+            "gptcot": len(df_gptcot),
+            "train": len(df_train),
+            "val": len(df_val),
+            "test": len(df_test),
+        }
+
 
 @stub.function()
 @modal.web_endpoint(label="status", method="GET")
 def get_status(mode):
     return stub.status_tracker[mode].__dict__
+
 
 @stub.function()
 @modal.web_endpoint(label="kill", method="POST")
@@ -244,6 +333,7 @@ def kill(mode):
         raise ValueError(f"Invalid mode {mode}")
     stub.status_tracker[mode + "kill"] = True
     return True
+
 
 class GenerationTask:
     excluded_abstracts = None
@@ -260,6 +350,7 @@ class GenerationTask:
         preprompt,
         prompt,
         model,
+        model_seed,
         include_dataset,
         exclude_dataset,
         gpt_cot_id=None,
@@ -287,13 +378,14 @@ class GenerationTask:
                 )
         else:
             raise ValueError(f"Invalid mode {mode}")
-        # Clear the persisted queue
-        self.get_all_result_queue()
+
         assert self.length_result_queue() == 0
 
         if abstract_in_investigation and abstract_in_investigation_actual_value:
             self.abstract_in_investigation = abstract_in_investigation
-            self.abstract_in_investigation_actual_value = abstract_in_investigation_actual_value
+            self.abstract_in_investigation_actual_value = (
+                abstract_in_investigation_actual_value
+            )
 
         self.num_excluded_abstracts = num_excluded_abstracts
         self.num_included_abstracts = num_included_abstracts
@@ -301,6 +393,7 @@ class GenerationTask:
         self.preprompt = preprompt
         self.prompt = prompt
         self.model = model
+        self.model_seed = model_seed
 
         self.include_dataset = include_dataset
         self.exclude_dataset = exclude_dataset
@@ -323,9 +416,11 @@ class GenerationTask:
         if self.gpt_cot_id and not (self.few_shot_exclude or self.few_shot_include):
             raise ValueError("gpt_cot_id provided but no fewshots")
         self.total = self.count()
-        if (abstract_in_investigation or abstract_in_investigation_actual_value):
+        if abstract_in_investigation or abstract_in_investigation_actual_value:
             if self.num_excluded_abstracts + self.num_included_abstracts > 0:
-                raise ValueError("abstract_in_investigation should not be provided when there are abstracts to process")
+                raise ValueError(
+                    "abstract_in_investigation should not be provided when there are abstracts to process"
+                )
         elif self.total == 0:
             raise ValueError("No abstracts to process")
 
@@ -342,9 +437,9 @@ class GenerationTask:
 
     def put_result_queue(self, result):
         self.result_queue.append(result)
-        
+
     def get_all_result_queue(self):
-        return self.result_queue
+        return sorted(self.result_queue, key=lambda x: x["test_abstract"])
 
     def length_result_queue(self):
         return len(self.result_queue)
@@ -353,8 +448,8 @@ class GenerationTask:
         import pandas as pd
         import os
         import numpy as np
-        
-        if "seed_generator" not in self.__dict__: 
+
+        if "seed_generator" not in self.__dict__:
             raise ValueError("seed_generator not set")
 
         # Load up volume files in memory
@@ -365,7 +460,7 @@ class GenerationTask:
             excluded_abstracts = df_excluded["Abstract"].replace("", np.nan).dropna()
         else:
             excluded_abstracts = df_excluded["Content"].replace("", np.nan).dropna()
-        
+
         df_included = pd.read_csv(
             os.path.join("/data", self.include_dataset), keep_default_na=False
         )
@@ -373,11 +468,15 @@ class GenerationTask:
             included_abstracts = df_included["Abstract"].replace("", np.nan).dropna()
         else:
             included_abstracts = df_included["Content"].replace("", np.nan).dropna()
-        self.excluded_abstracts = excluded_abstracts.sample(frac=1, random_state=self.seed_generator)
-        self.included_abstracts = included_abstracts.sample(frac=1, random_state=self.seed_generator)
+        self.excluded_abstracts = excluded_abstracts.sample(
+            frac=1, random_state=self.seed_generator
+        )
+        self.included_abstracts = included_abstracts.sample(
+            frac=1, random_state=self.seed_generator
+        )
         self.get_next_abstract_excluded = self.get_next_abstract_generator(True)
-        self.get_next_abstract_included = self.get_next_abstract_generator(False) 
-        
+        self.get_next_abstract_included = self.get_next_abstract_generator(False)
+
     # generator
     def get_next_abstract_generator(self, exclude):
         if exclude:
@@ -387,25 +486,36 @@ class GenerationTask:
             for abstract in self.included_abstracts:
                 yield abstract
         else:
-            raise ValueError(f"Invalid actual_value excluded={exclude}, this should never happen")
+            raise ValueError(
+                f"Invalid actual_value excluded={exclude}, this should never happen"
+            )
 
-    def get_abstracts(self, actual_value="excluded", n=1, random_state=None, mode="testset"):
+    def get_abstracts(
+        self, actual_value="excluded", n=1, random_state=None, mode="testset"
+    ):
         if self.abstract_in_investigation:
             import pandas as pd
+
             return pd.Series([self.abstract_in_investigation])
         exclude = True if actual_value == "excluded" else False
         if exclude:
-            samples = self.excluded_abstracts.sample(n=n, random_state=random_state, replace=False)
+            samples = self.excluded_abstracts.sample(
+                n=n, random_state=random_state, replace=False
+            )
             # Sample without replacement
             self.excluded_abstracts = self.excluded_abstracts.drop(samples.index)
             return samples
         else:
-            samples = self.included_abstracts.sample(n=n, random_state=random_state, replace=False)
+            samples = self.included_abstracts.sample(
+                n=n, random_state=random_state, replace=False
+            )
             # Sample without replacement
             self.included_abstracts = self.included_abstracts.drop(samples.index)
             return samples
 
-    def get_cot_abstract_dataframe(self, actual_value="excluded", n=1, seed_generator=None):
+    def get_cot_abstract_dataframe(
+        self, actual_value="excluded", n=1, seed_generator=None
+    ):
         if self.gpt_cot is None:
             raise ValueError("gpt_cot is not loaded")
         return self.gpt_cot[self.gpt_cot["actual_value"] == actual_value].sample(
@@ -443,10 +553,12 @@ class GenerationTask:
         """
         return np.random.default_rng(self.seed_generator.integers(0, 2**32 - 1))
 
-    def check_completion(self):
+    def check_completion(self, i=0):
         # Currently, failures not thrown during text generation do not stop execution.
         if self.length_result_queue() != self.total:
-            print("ERROR ### result_queue.len() != self.total, returning what's left anyways")
+            print(
+                f"ERROR ### generation_task {i}, result_queue.len() != self.total, returning what's left anyways"
+            )
 
     def cleanup(self):
         self.excluded_abstracts = None
@@ -455,15 +567,16 @@ class GenerationTask:
         # remove all generators because they cannot be pickled
         self.get_next_abstract_excluded = None
         self.get_next_abstract_included = None
-        
+
 
 class KillException(Exception):
     pass
 
+
 class Item(BaseModel):
     abstract_in_investigation: str = None
     abstract_in_investigation_actual_value: str = None
-    
+
     include_samples: int
     exclude_samples: int
     model: str = "gemini-pro"
@@ -478,6 +591,7 @@ class Item(BaseModel):
     exclude_dataset: str
 
     seed: int = 1
+    ensemble: int = 1
 
 
 class COTItem(BaseModel):
@@ -502,9 +616,10 @@ class Result(BaseModel):
 
     error: Union[str, None] = None
     predicted_value: Union[str, None] = ""
+    predicted_values: list[str] = []
     actual_value: str = ""
     test_abstract: str = ""
-    
+
     token_counts: dict = {}
 
 
@@ -527,7 +642,8 @@ def f(item: Item):
     call = run_f.spawn(item)
     print("Starting run with ", call.object_id)
     return {"function_id": call.object_id}
-    
+
+
 @stub.function()
 @modal.web_endpoint(label="check-test", method="GET")
 def check_test(function_id=None):
@@ -540,80 +656,130 @@ def check_test(function_id=None):
         return {"function_id": run_f_function.object_id}
     except:
         raise ValueError("Invalid state")
-    
-@stub.function(timeout=60*60)
+
+
+@stub.function(timeout=60 * 60)
 def run_f(item: Item):
     import time
+
     start_time = time.time()
     correct_count = 0
     completed_count = 0
     skipped_count = 0
     results = []
     mode = "test"
-    
+
     stub.status_tracker[mode + "kill"] = False
 
-    total_prompts = item.include_samples + item.exclude_samples
-
-    generation_task = GenerationTask(
-        mode,
-        item.exclude_samples,
-        item.include_samples,
-        item.preprompt,
-        item.prompt,
-        item.model,
-        item.include_dataset,
-        item.exclude_dataset,
-        gpt_cot_id=item.gpt_cot_id,
-        few_shot_exclude=item.few_shot_exclude,
-        few_shot_include=item.few_shot_include,
-        abstract_in_investigation=item.abstract_in_investigation,
-        abstract_in_investigation_actual_value=item.abstract_in_investigation_actual_value,
-    )
+    generation_tasks: list[GenerationTask] = []
+    for model_seed in range(item.ensemble):
+        generation_tasks.append(
+            GenerationTask(
+                mode,
+                item.exclude_samples,
+                item.include_samples,
+                item.preprompt,
+                item.prompt,
+                item.model,
+                model_seed,
+                item.include_dataset,
+                item.exclude_dataset,
+                gpt_cot_id=item.gpt_cot_id,
+                few_shot_exclude=item.few_shot_exclude,
+                few_shot_include=item.few_shot_include,
+                abstract_in_investigation=item.abstract_in_investigation,
+                abstract_in_investigation_actual_value=item.abstract_in_investigation_actual_value,
+            )
+        )
 
     try:
-        generation_task = gen.remote(
+        generation_tasks = gen.remote(
             item.seed,
-            generation_task,
+            generation_tasks,
         )
     except KillException:
         stub.status_tracker[mode + "kill"] = False
 
-    generation_task.check_completion()
     import tiktoken
-    for res in generation_task.get_all_result_queue():
-        if res["skipped"]:
-            skipped_count += 1
-        else:
-            if res["correct"]:
-                correct_count += 1
-            completed_count += 1
 
+    for i, generation_task in enumerate(generation_tasks):
+        generation_task.check_completion(i)
+
+    from collections import defaultdict
+    total_result_queue = [result_raw for generation_task in generation_tasks for result_raw in generation_task.get_all_result_queue() ]
+    result_queue_dict = defaultdict(list)
+    for result_raw in total_result_queue:
+        result_queue_dict[result_raw["abstract_id"]].append(result_raw)
+
+    for res_key in result_queue_dict:
+        from collections import Counter
+        res_tuple = result_queue_dict[res_key]
+
+        # Aggregate stats
+        is_skipped = 0
+        index_of_skipped = -1
+
+        for i, res in enumerate(res_tuple):
+            if res["skipped"]:
+                is_skipped = 1
+                index_of_skipped = i
+                break
+        skipped_count += is_skipped
+        completed_count += not is_skipped
+
+        # Token counting
         encoding = tiktoken.get_encoding(TOKENIZER)
-        
-        llm_answer = res.get("llm_answer") or ""
-        token_counts = {"llm_answer": len(encoding.encode(llm_answer)), "prompt": len(encoding.encode(res["prompt"]))}
+        appended_llm_answers = [res.get("llm_answer") or "" for res in res_tuple]
+        llm_answers_token_counts = sum(
+            [
+                len(encoding.encode(appended_llm_answer))
+                for appended_llm_answer in appended_llm_answers
+            ]
+        )
+        prompt_token_count = len(encoding.encode(res["prompt"]))
+        token_counts = {
+            "llm_answer": llm_answers_token_counts,
+            "prompt": prompt_token_count,
+            "prompt_total": prompt_token_count * item.ensemble,
+        }
+
+        prompt = res_tuple[0]["prompt"]
+        llm_answer = "\n---\n".join(appended_llm_answers)
+        skipped = True if is_skipped else False
+        predicted_value = Counter(
+            [res["predicted_value"] for res in res_tuple]
+        ).most_common(1)[0][0]
+        actual_value = res_tuple[0]["actual_value"]
+        correct = predicted_value == actual_value
+        error = str(res_tuple[index_of_skipped]["error"]) if is_skipped else None
+        test_abstract = res_tuple[0]["test_abstract"]
+        token_counts = token_counts
+        predicted_values = [res["predicted_value"] for res in res_tuple]
+
+        correct_count += correct if not is_skipped else 0
+
         results.append(
             Result(
-                prompt=res["prompt"],
+                prompt=prompt,
                 llm_answer=llm_answer,
-                correct=res["correct"],
-                skipped=res["skipped"],
-                predicted_value=res["predicted_value"],
-                actual_value=res["actual_value"],
-                error=str(res["error"]) if res["skipped"] else None,
-                test_abstract=res["test_abstract"],
-                token_counts=token_counts
+                correct=correct,
+                skipped=skipped,
+                predicted_value=predicted_value,
+                actual_value=actual_value,
+                error=error,
+                test_abstract=test_abstract,
+                token_counts=token_counts,
+                predicted_values=predicted_values,
             )
         )
 
     status_tracker: StatusTracker = stub.status_tracker[mode]
     stub.status_tracker[mode] = StatusTracker(mode)
-    
+
     print("Completed, status: ", status_tracker.__dict__)
     end_time = time.time()
     print("Time taken: ", end_time - start_time)
-    
+
     final_results = {
         "model": item.model,
         "results": results,
@@ -625,19 +791,23 @@ def run_f(item: Item):
         "exclude_dataset": item.exclude_dataset,
         "few_shot_exclude": item.few_shot_exclude,
         "few_shot_include": item.few_shot_include,
+        "ensemble": item.ensemble,
     }
-    
+
     save_final_results.spawn(final_results, time=int(time.time()))
 
     return final_results
 
+
 @stub.function(volumes={MOUNT_DIR: vol_save_results})
 async def save_final_results(final_results, time):
     final_results["results"] = [result.dict() for result in final_results["results"]]
-    with open(os.path.join(MOUNT_DIR, f"results_{time}.json"), 'w') as f:
+    with open(os.path.join(MOUNT_DIR, f"results_{time}.json"), "w") as f:
         import json
+
         json.dump(final_results, f)
     vol_save_results.commit()
+
 
 @stub.function(volumes={MOUNT_DIR_COT: cot_vol}, timeout=600)
 @modal.web_endpoint(label="gptcot", method="POST")
@@ -647,7 +817,7 @@ async def gptcot(item: COTItem):
     skipped_count = 0
     results = []
     mode = "gptcot"
-    
+
     stub.status_tracker[mode + "kill"] = False
 
     num_excluded_abstracts = item.exclude_samples
@@ -662,8 +832,9 @@ async def gptcot(item: COTItem):
         item.preprompt,
         item.prompt,
         item.model,
+        1,
         item.include_dataset,
-        item.exclude_dataset
+        item.exclude_dataset,
     )
 
     try:
@@ -674,6 +845,8 @@ async def gptcot(item: COTItem):
     except KillException:
         stub.status_tracker[mode + "kill"] = False
 
+    if isinstance(generation_task, list):
+        generation_task = generation_task[0]
     generation_task.check_completion()
 
     for res in generation_task.get_all_result_queue():
@@ -699,7 +872,7 @@ async def gptcot(item: COTItem):
 
     status_tracker = stub.status_tracker[mode]
     stub.status_tracker[mode] = StatusTracker(mode)
-    
+
     unique_id = generate_unique_id()
 
     def filter_and_save_results(unique_id, results):
@@ -730,7 +903,9 @@ async def gptcot(item: COTItem):
         cot_vol.commit()
         return number_used_excluded, number_used_included
 
-    number_used_excluded, number_used_included = filter_and_save_results(unique_id, results)
+    number_used_excluded, number_used_included = filter_and_save_results(
+        unique_id, results
+    )
 
     print("Completed and saved as ", unique_id)
 
@@ -752,7 +927,7 @@ async def gptcot(item: COTItem):
 
 
 @stub.function()
-def setup(model):
+def setup(model, model_seed):
     if model == "gemini-pro":
         import google.generativeai as genai
 
@@ -778,6 +953,7 @@ def setup(model):
             },
         ]
 
+        # TODO: add seed
         client = genai.GenerativeModel(
             model_name=model,
             generation_config=generation_config,
@@ -794,6 +970,7 @@ def setup(model):
         model == "gpt-3.5-turbo"
         or model == "gpt-4-0125-preview"
         or model == "gpt-3.5-turbo-0125"
+        or model == "gpt-4-turbo-2024-04-09"
     ):
         from openai import AsyncOpenAI
 
@@ -806,7 +983,7 @@ def setup(model):
                         messages=generate_messages(model, prompt),
                         model=model,
                         max_tokens=MAX_COMPLETION_TOKENS,
-                        seed=TEXT_SEED,
+                        seed=model_seed,
                     )
                 )
                 .choices[0]
@@ -826,6 +1003,7 @@ def calculate_tokens(model, prompt, max_token_response):
         model == "gpt-3.5-turbo"
         or model == "gpt-4-0125-preview"
         or model == "gpt-3.5-turbo-0125"
+        or model == "gpt-4-turbo-2024-04-09"
     ):
         import tiktoken
 
@@ -872,6 +1050,7 @@ def generate_messages(model, prompt):
         model == "gpt-3.5-turbo"
         or model == "gpt-4-0125-preview"
         or model == "gpt-3.5-turbo-0125"
+        or model == "gpt-4-turbo-2024-04-09"
     ):
         return [{"role": "user", "content": prompt}]
     else:
@@ -884,41 +1063,49 @@ def generate_messages(model, prompt):
         modal.Secret.from_name("srma-openai"),
         modal.Secret.from_name("srma-gemini"),
     ],
-    memory=1024,
+    memory=2048,
     cpu=2.0,
-    timeout=60 * 60
+    timeout=60 * 60 * 2,
 )
 async def gen(
     seed: int,
-    generation_task: GenerationTask,
+    generation_tasks: Union[GenerationTask, list[GenerationTask]],
 ):
     import asyncio
     import logging
 
-
-    ### SLOW Reading from disk
-    cot_vol.reload()
-    generation_task.default_rng(seed)
-    generation_task.load_abstracts()
-    generation_task.load_gpt_cot()
-    ### SLOW Reading from disk
+    if not isinstance(generation_tasks, list):
+        generation_tasks = [generation_tasks]
 
     # initialize logging
     logging_level = logging.INFO
     logging.basicConfig(level=logging_level)
     logging.debug(f"Logging initialized at level {logging_level}")
 
-    # it seems like gemini-pro has a rate limit that updates every half minute
-    seconds_to_pause_after_rate_limit_error = (
-        30 if generation_task.model == "gemini-pro" else 15
-    )
     seconds_to_sleep_each_loop = (
         0.007  # 7 ms limits max throughput to 142 requests per second
     )
     queue_of_requests_to_retry = asyncio.Queue()
     task_id_generator = task_id_generator_function()
-    status_tracker = StatusTracker(generation_task.mode)
+
     next_request = None  # variable to hold the next request to call
+
+    for generation_task in generation_tasks:
+        ### SLOW Reading from disk
+        cot_vol.reload()
+        generation_task.default_rng(seed)
+        generation_task.load_abstracts()
+        generation_task.load_gpt_cot()
+        ### SLOW Reading from disk
+
+    i = 0
+    generation_task = generation_tasks[i]
+    status_tracker = StatusTracker(generation_task.mode)
+    # it seems like gemini-pro has a rate limit that updates every half minute
+    seconds_to_pause_after_rate_limit_error = (
+        30 if generation_task.model == "gemini-pro" else 15
+    )
+
     # initialize available capacity counts
     max_requests_per_minute = USAGE_LIMITS[generation_task.model][
         "max_requests_per_minute"
@@ -930,8 +1117,14 @@ async def gen(
 
     while True:
         if next_request is None:
+            if not generation_task.count() and i < len(generation_tasks) - 1:
+                i += 1
+                generation_task.cleanup()
+                generation_task = generation_tasks[i]
             if generation_task.count():
-                logging.info(f"Number of prompts left: {generation_task.count()}")
+                logging.info(
+                    f"Number of prompts left in generation_task {i}: {generation_task.count()}"
+                )
                 next_request = Abstract(
                     task_id=next(task_id_generator),
                     generation_task=generation_task,
@@ -1010,7 +1203,7 @@ async def gen(
     stub.status_tracker[generation_task.mode] = status_tracker
 
     generation_task.cleanup()
-    return generation_task
+    return generation_tasks
 
 
 # @stub.function(
@@ -1048,18 +1241,21 @@ class StatusTracker:
         self.num_tasks_started += 1
         self.num_tasks_in_progress += 1
         stub.status_tracker[self.mode] = self
+
     def error(self):
         self.num_other_errors += 1
         stub.status_tracker[self.mode] = self
+
     def fail(self):
         self.num_tasks_in_progress -= 1
         self.num_tasks_failed += 1
         stub.status_tracker[self.mode] = self
+
     def success(self):
         self.num_tasks_in_progress -= 1
         self.num_tasks_succeeded += 1
         stub.status_tracker[self.mode] = self
-        
+
 
 @dataclass
 class Abstract:
@@ -1072,14 +1268,7 @@ class Abstract:
     result: list = field(default_factory=list)
     token_consumption: int = 0
     abstract: str = ""
-
-    def sample_abstract(self, actual_value, seed_generator, mode, n=1):
-
-        abstracts = (
-            self.generation_task.get_abstracts(actual_value=actual_value, n=n, random_state=seed_generator, mode=mode)
-        )
-
-        return abstracts
+    abstract_id: int = 1
 
     def sample_cot_abstract(self, actual_value, seed_generator, n=1):
         searchable_abstracts = self.generation_task.get_cot_abstract_dataframe(
@@ -1097,45 +1286,49 @@ class Abstract:
         if self.final_prompt:
             return
         self.actual_value = self.generation_task.consume()
-        
+
         if self.actual_value == "excluded":
             self.abstract = next(self.generation_task.get_next_abstract_excluded)
         else:
             self.abstract = next(self.generation_task.get_next_abstract_included)
 
         seed_generator_few_shot = self.generation_task.new_default_rng()
+        
+        self.abstract_id = hash(self.abstract)
 
         few_shot_text = ""
         if self.generation_task.needs_append_few_shots():
             if not self.generation_task.is_generated_few_shot():
-                raise ValueError("do not use this type of few shot anymore, use cot in some form")
-                few_shot_text += "\n# Start of Examples\n"
-                number_include = self.generation_task.few_shot_include
-                number_exclude = self.generation_task.few_shot_exclude
-
-                few_shot_exclusionary_abstracts = self.sample_abstract(
-                    "excluded", seed_generator_few_shot, n=number_exclude, mode="fewshot"
+                raise ValueError(
+                    "do not use this type of few shot anymore, use cot in some form"
                 )
-                few_shot_inclusionary_abstracts = self.sample_abstract(
-                    "included", seed_generator_few_shot, n=number_include, mode="fewshot"
-                )
+            #             few_shot_text += "\n# Start of Examples\n"
+            #             number_include = self.generation_task.few_shot_include
+            #             number_exclude = self.generation_task.few_shot_exclude
 
-                for abstract in few_shot_exclusionary_abstracts:
-                    few_shot_text += f"""
-    ---
-    {abstract}
+            #             few_shot_exclusionary_abstracts = self.sample_abstract(
+            #                 "excluded", seed_generator_few_shot, n=number_exclude, mode="fewshot"
+            #             )
+            #             few_shot_inclusionary_abstracts = self.sample_abstract(
+            #                 "included", seed_generator_few_shot, n=number_include, mode="fewshot"
+            #             )
 
-    This article should be excluded.
-    """
-                for abstract in few_shot_inclusionary_abstracts:
-                    few_shot_text += f"""
-    ---
-    {abstract}
+            #             for abstract in few_shot_exclusionary_abstracts:
+            #                 few_shot_text += f"""
+            # ---
+            # {abstract}
 
-    This article should be included.
+            # This article should be excluded.
+            # """
+            #             for abstract in few_shot_inclusionary_abstracts:
+            #                 few_shot_text += f"""
+            # ---
+            # {abstract}
 
-    """
-                few_shot_text += "\n# End of Examples\n"
+            # This article should be included.
+
+            # """
+            #             few_shot_text += "\n# End of Examples\n"
             elif self.generation_task.is_generated_few_shot():
                 few_shot_text += "\n# Start of Examples\n"
                 number_include = self.generation_task.few_shot_include
@@ -1188,10 +1381,15 @@ class Abstract:
         try:
             ###### BUSINESS
             # Setup the model
-            model_async = setup.local(self.generation_task.model)
+            model_async = setup.local(
+                self.generation_task.model, self.generation_task.model_seed
+            )
             import asyncio
+
             # Model produces response
-            llm_answer = await asyncio.wait_for(model_async(self.final_prompt), timeout=120)
+            llm_answer = await asyncio.wait_for(
+                model_async(self.final_prompt), timeout=120
+            )
 
             # Evaluate response
             predicted_value = is_excluded(llm_answer, self.final_prompt)
@@ -1217,6 +1415,7 @@ class Abstract:
                         "actual_value": "fail",
                         "llm_answer": "fail",
                         "test_abstract": self.abstract,
+                        "abstract_id": self.abstract_id,
                     }
                 )
                 status_tracker.fail()
@@ -1231,6 +1430,7 @@ class Abstract:
                     "actual_value": self.actual_value,
                     "llm_answer": llm_answer,
                     "test_abstract": self.abstract,
+                    "abstract_id": self.abstract_id,
                 }
             )
             status_tracker.success()
@@ -1259,7 +1459,7 @@ def generate_unique_id():
 )
 def create_subsets():
     import os
-    
+
     # Clean all generated files
     remove_files.local()
 
@@ -1269,7 +1469,7 @@ def create_subsets():
 
     # split into train and test sets, use 800 for gptcot, 800 for train, 800 for validation, and the rest for testing
     _ = list(create_subset.map(files))
-    
+
     vol_dataset.reload()
     print(os.listdir(MOUNT_DIR))
     return True
@@ -1282,55 +1482,60 @@ def create_subset(file):
     import os
     import pandas as pd
     import random
+
     random.seed(1337)
-    
 
     print("Processing ", file)
     df = pd.read_csv(os.path.join(MOUNT_DIR, file), low_memory=False)
     # remove .csv from end of filename using os
     file = os.path.splitext(file)[0]
-    split = min(800, (len(df) - 400)//3)
-    
+    split = min(800, (len(df) - 400) // 3)
+
     if split < 800:
-        split = len(df)//2
-        
+        split = len(df) // 2
+
         train = df.sample(split, random_state=1337)
         test = df.drop(train.index)
-        
-        train.to_csv(os.path.join(MOUNT_DIR, f"{file}_gen_train_{split}.csv"), index=False)
+
+        train.to_csv(
+            os.path.join(MOUNT_DIR, f"{file}_gen_train_{split}.csv"), index=False
+        )
         print("Train saved as ", f"{file}_gen_train_{split}.csv")
-        
+
         test.to_csv(os.path.join(MOUNT_DIR, f"{file}_gen_test.csv"), index=False)
         print("Test saved as ", f"{file}_gen_test.csv")
-        
+
         vol_dataset.commit()
         return True
-    
+
     gptcot_set = df.sample(split, random_state=1337)
     df = df.drop(gptcot_set.index)
-    
+
     train = df.sample(split, random_state=1337)
     df = df.drop(train.index)
-    
+
     validation = df.sample(split, random_state=1337)
     test = df.drop(validation.index)
-    
-    gptcot_set.to_csv(os.path.join(MOUNT_DIR, f"{file}_gen_gpt_cot_{split}.csv"), index=False)
+
+    gptcot_set.to_csv(
+        os.path.join(MOUNT_DIR, f"{file}_gen_gpt_cot_{split}.csv"), index=False
+    )
     print("GPT CoT set saved as ", f"{file}_gen_gpt_cot_{split}.csv")
-    
+
     train.to_csv(os.path.join(MOUNT_DIR, f"{file}_gen_train_{split}.csv"), index=False)
     print("Train saved as ", f"{file}_gen_train_{split}.csv")
-    
+
     validation.to_csv(
         os.path.join(MOUNT_DIR, f"{file}_gen_validation_{split}.csv"), index=False
     )
     print("Validation saved as ", f"{file}_gen_validation_{split}.csv")
-    
+
     test.to_csv(os.path.join(MOUNT_DIR, f"{file}_gen_test.csv"), index=False)
     print("Test saved as ", f"{file}_gen_test.csv")
-    
+
     vol_dataset.commit()
     return True
+
 
 @stub.function(
     volumes={MOUNT_DIR: vol_dataset},
@@ -1338,6 +1543,7 @@ def create_subset(file):
 def remove_files():
     import os
     import glob
+
     glob_pattern = os.path.join(MOUNT_DIR, "*gen*")
     files = glob.glob(glob_pattern)
     print(files)
@@ -1345,6 +1551,7 @@ def remove_files():
         os.remove(os.path.join(MOUNT_DIR, file))
     vol_dataset.commit()
     return True
+
 
 @stub.local_entrypoint()
 def main():
