@@ -10,7 +10,7 @@ import numpy as np
 
 # Constant texts
 FINAL_PROMPT = "{preprompt}\n{few_shot_text}\n# Abstract in investigation: \n{test_abstract}\n\n{prompt}\n"
-FILTER_EMPTY_COLUMNS = ["Abstract", "Content"]
+COLUMNS = ["Abstract", "Content"]
 
 ### LLM SETTINGS
 MAX_COMPLETION_TOKENS = 2048
@@ -102,7 +102,7 @@ async def dataset_upload(file: UploadFile = File(...)):
     data = content.decode("utf-8")
     df = pd.read_csv(StringIO(data), low_memory=False)
     df = df.fillna(np.nan)
-    for col in FILTER_EMPTY_COLUMNS:
+    for col in COLUMNS:
         if col in df.columns:
             df = df.dropna(subset=[col])
     df.to_csv(os.path.join(MOUNT_DIR, file.filename), index=False)
