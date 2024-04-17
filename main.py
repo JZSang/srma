@@ -786,13 +786,11 @@ class Abstract:
         self.actual_value = self.generation_task.consume()
 
         if self.actual_value == "excluded":
-            self.abstract = next(self.generation_task.get_next_abstract_excluded)
+            self.abstract, self.abstract_id = next(self.generation_task.get_next_abstract_excluded)
         else:
-            self.abstract = next(self.generation_task.get_next_abstract_included)
+            self.abstract, self.abstract_id = next(self.generation_task.get_next_abstract_included)
 
         seed_generator_few_shot = self.generation_task.new_default_rng()
-
-        self.abstract_id = hash(self.abstract)
 
         few_shot_text = ""
         if self.generation_task.needs_append_few_shots():

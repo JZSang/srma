@@ -134,10 +134,10 @@ class GenerationTask:
         else:
             included_abstracts = df_included["Content"].replace("", np.nan).dropna()
         self.excluded_abstracts = excluded_abstracts.sample(
-            frac=1, random_state=self.seed_generator
+            frac=1, random_state=1
         )
         self.included_abstracts = included_abstracts.sample(
-            frac=1, random_state=self.seed_generator
+            frac=1, random_state=1
         )
         self.get_next_abstract_excluded = self.get_next_abstract_generator(True)
         self.get_next_abstract_included = self.get_next_abstract_generator(False)
@@ -145,11 +145,11 @@ class GenerationTask:
     # generator
     def get_next_abstract_generator(self, exclude):
         if exclude:
-            for abstract in self.excluded_abstracts:
-                yield abstract
+            for i,abstract in enumerate(self.excluded_abstracts):
+                yield abstract, i
         elif not exclude:
-            for abstract in self.included_abstracts:
-                yield abstract
+            for i,abstract in enumerate(self.included_abstracts):
+                yield abstract, i
         else:
             raise ValueError(
                 f"Invalid actual_value excluded={exclude}, this should never happen"
