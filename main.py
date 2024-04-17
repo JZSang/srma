@@ -1,576 +1,82 @@
+# Modal
 import modal
+
+# System
 import os
 import time
-from pydantic import BaseModel
-from dataclasses import dataclass, field
-from fastapi import UploadFile, File
-from typing import Union
 import asyncio
-import numpy as np
+from typing import Literal, Optional, Union
+from dataclasses import dataclass, field
 
-# Constant texts
-FINAL_PROMPT = "{preprompt}\n{few_shot_text}\n# Abstract in investigation: \n{test_abstract}\n\n{prompt}\n"
-COLUMNS = ["Abstract", "Content"]
+# Typing
+from pydantic import BaseModel
+from fastapi import UploadFile, File, Body
 
-### LLM SETTINGS
-MAX_COMPLETION_TOKENS = 2048
-USAGE_LIMITS = {
-    "gpt-3.5-turbo": {
-        "max_requests_per_minute": 10000,
-        "max_tokens_per_minute": 2000000,
-    },
-    "gpt-4-0125-preview": {
-        "max_requests_per_minute": 10000,
-        "max_tokens_per_minute": 1500000,
-    },
-    "gpt-4-turbo-2024-04-09": {
-        "max_requests_per_minute": 10000,
-        "max_tokens_per_minute": 1500000,
-    },
-    "gpt-3.5-turbo-0125": {
-        "max_requests_per_minute": 10000,
-        "max_tokens_per_minute": 2000000,
-    },
-    "gemini-pro": {
-        "max_requests_per_minute": 60,
-        "max_tokens_per_minute": float("inf"),
-    },
-}
-TOKENIZER = "cl100k_base"
-TEXT_SEED = 1337
-
-### MODAL SETTINGS
-WORKSPACE = "jzsang"
-
-### Raw dataset storage
-# vol_dataset = modal.Volume.persisted("srma")
-vol_dataset = modal.Volume.persisted("srma-dataset")
-MOUNT_DIR = "/data"
-EXCLUDED_ABSTRACTS = "excl_final.csv"
-INCLUDED_ABSTRACTS = "incl_final.csv"
-
-
-### GPTCoT storage
-MOUNT_DIR_COT = "/cot"
-cot_vol = modal.Volume.persisted("srma-cot")
-
-vol_save_results = modal.Volume.persisted("srma-results")
-
-
-### MODAL INITIALIZERS
-stub = modal.Stub(
-    "srma-retool",
-    image=modal.Image.debian_slim().pip_install(
-        ["google-generativeai", "pandas", "openai", "tiktoken"]
-    ),
+# Source
+from modal_references import vol_dataset, vol_save_results, cot_vol, stub
+from datasets.upload import dataset_upload_impl
+from datasets.manage import dataset_manage_wrapper, DatasetManage
+from operations.kill import kill_impl, KillException
+from operations.status import get_status_impl
+from tasks.generation_task import GenerationTask
+from constants import (
+    MOUNT_DIR,
+    MOUNT_DIR_COT,
+    TOKENIZER,
+    MAX_COMPLETION_TOKENS,
+    USAGE_LIMITS,
 )
 
-### Producer-Consumer Queues
-stub.result_queue = modal.Queue.new()
-stub.cot_result_queue = modal.Queue.new()
-
-### Process status tracker
-stub.status_tracker = modal.Dict.new()
-
-stub.file_lock = modal.Dict.new()
-stub.file_metadata_queue = modal.Queue.new()
+# Prompt format
+FINAL_PROMPT = "{preprompt}\n{few_shot_text}\n# Abstract in investigation: \n{test_abstract}\n\n{prompt}\n"
 
 
-class Metadata(BaseModel):
-    lines: int
-    size: int
-    columns: list[str]
-    filtered: bool
-    file: str
-    deleted: bool
-    original_file: str
-    split_type: str
+UploadOperations = Literal["dataset_upload"]
 
+@stub.function()
+@modal.web_endpoint(label="router-upload", method="POST")
+async def router_upload(operation: UploadOperations, file: UploadFile = File(...)):
+    if operation == "dataset_upload":
+        return await dataset_upload(file)
+    else:
+        raise ValueError("Invalid operation")
 
-@stub.function(volumes={MOUNT_DIR: vol_dataset})
-@modal.web_endpoint(label="dataset-upload", method="POST")
+Operations = Literal["dataset_manage", "status", "kill"]
+class Routing(BaseModel):    
+    dataset_manage: DatasetManage = None
+    status: str = None
+    kill: str = None
+
+@stub.function()
+@modal.web_endpoint(label="router", method="POST")
+async def router(routing: Routing, operation: Operations):
+    print("CANONICAL-API-LINE: ", operation, routing.dict())
+    if operation == "dataset_manage":
+        return dataset_manage(routing.dataset_manage)
+    elif operation == "status":
+        return get_status(routing.status)
+    elif operation == "kill":
+        return kill(routing.kill)
+    else:
+        raise ValueError("Invalid operation")
+
 async def dataset_upload(file: UploadFile = File(...)):
     if file.content_type != "text/csv":
         raise ValueError("File must be a CSV")
-
-    import pandas as pd
-    import numpy as np
-    from io import StringIO
-
-    # 1. Save the file
     content = await file.read()
-    data = content.decode("utf-8")
-    df = pd.read_csv(StringIO(data), low_memory=False)
-    df = df.fillna(np.nan)
-    for col in COLUMNS:
-        if col in df.columns:
-            df = df.dropna(subset=[col])
-    df.to_csv(os.path.join(MOUNT_DIR, file.filename), index=False)
-
-    # Add metadata to be saved into a queue. Will call on page load.
-    info = Metadata(
-        split_type="Raw",
-        lines=len(df),
-        size=os.path.getsize(os.path.join(MOUNT_DIR, file.filename)),
-        columns=list(df.columns),
-        filtered=False,
-        file=file.filename,
-        deleted=False,
-        original_file=file.filename,
-    )
-    stub.file_metadata_queue.put(info)
-
-    # 2. Commit
-    vol_dataset.commit()
-
-    # 3. Show preview
-    return info
+    return dataset_upload_impl.remote(content, filename=file.filename)
 
 
-class DatasetManage(BaseModel):
-    type: str = "ls"
-    file: str = None
-    files: list[str] = None
-
-    column: str = None
-
-    splits: tuple[int, int, int, int] = None
-
-
-@stub.function(volumes={MOUNT_DIR: vol_dataset})
-@modal.web_endpoint(label="dataset-manage", method="POST")
-async def dataset_manage(params: DatasetManage):
-    # Pause operation until lock is released
-    while stub.file_lock.get("lock", False):
-        await asyncio.sleep(0.1)
-    stub.file_lock["lock"] = True
-    try:
-        ret = await dataset_manage_impl(params)
-    finally:
-        stub.file_lock["lock"] = False
+def dataset_manage(params: DatasetManage):
+    ret = dataset_manage_wrapper.remote(params)
     return ret
 
-
-async def dataset_manage_impl(params: DatasetManage):
-    if params.type == "delete":
-        if not params.files:
-            return True
-        import os
-
-        for file in params.files:
-            os.remove(os.path.join(MOUNT_DIR, file))
-            # Make sure there's if statement to check deleted
-            # Make sure that deleted instances throw an error
-            stub.file_metadata_queue.put(
-                Metadata(
-                    split_type="Raw",
-                    lines=0,
-                    size=0,
-                    columns=[],
-                    filtered=False,
-                    file=file,
-                    deleted=True,
-                    original_file=file,
-                )
-            )
-        vol_dataset.commit()
-
-        return True
-    elif params.type == "ls":
-        import os
-
-        files: list[Metadata] = stub.file_metadata_queue.get_many(9999, block=False)
-        if files:
-            vol_dataset.reload()
-            with open(os.path.join(MOUNT_DIR, "metadata.json"), "r") as f:
-                import json
-
-                data = json.load(f)
-            with open(os.path.join(MOUNT_DIR, "metadata.json"), "w") as f:
-                for file in files:
-                    if file.deleted:
-                        del data[file.file]
-                        continue
-                    data[file.file] = file.dict()
-                json.dump(data, f)
-
-            vol_dataset.commit()
-        with open(os.path.join(MOUNT_DIR, "metadata.json"), "r") as f:
-            import json
-
-            content = json.load(f)
-            return [content[file] for file in sorted(content.keys())]
-
-    elif params.type == "filter_na":
-        import pandas as pd
-
-        vol_dataset.reload()
-        df = pd.read_csv(os.path.join(MOUNT_DIR, params.file))
-        df = df.dropna(subset=[params.column])
-        df.to_csv(os.path.join(MOUNT_DIR, params.file), index=False)
-
-        stub.file_metadata_queue.put(
-            Metadata(
-                lines=len(df),
-                size=os.path.getsize(os.path.join(MOUNT_DIR, params.file)),
-                columns=list(df.columns),
-                filtered=True,
-                file=params.file,
-                deleted=False,
-                original_file=params.file,
-            )
-        )
-
-        vol_dataset.commit()
-        return {"remaining_empty": df[params.column].isna().sum()}
-
-    elif params.type == "split":
-        import pandas as pd
-        import numpy as np
-        import os
-
-        np.random.seed(1337)
-
-        # validate
-        gptcot, train, val, test = params.splits
-
-        vol_dataset.reload()
-        df = pd.read_csv(os.path.join(MOUNT_DIR, params.file), low_memory=False)
-        if gptcot + train + val + test != len(df):
-            raise ValueError("Invalid split sizes")
-
-        # create dataframe splits
-        df_gptcot = df.sample(gptcot)
-        df = df.drop(df_gptcot.index)
-
-        df_train = df.sample(train)
-        df = df.drop(df_train.index)
-
-        df_val = df.sample(val)
-        df = df.drop(df_val.index)
-
-        df_test = df.sample(test)
-        df = df.drop(df_test.index)
-
-        filename = os.path.splitext(params.file)[0]
-
-        # save to disk
-        gptcot_filename = f"{filename}_gen_{gptcot}_gptcot.csv"
-        train_filename = f"{filename}_gen_{train}_train.csv"
-        val_filename = f"{filename}_gen_{val}_val.csv"
-        test_filename = f"{filename}_gen_{test}_test.csv"
-        df_gptcot.to_csv(os.path.join(MOUNT_DIR, gptcot_filename), index=False)
-        df_train.to_csv(os.path.join(MOUNT_DIR, train_filename), index=False)
-        df_val.to_csv(os.path.join(MOUNT_DIR, val_filename), index=False)
-        df_test.to_csv(os.path.join(MOUNT_DIR, test_filename), index=False)
-
-        # generate metadata
-        info_gptcot = Metadata(
-            split_type="GPTCoT",
-            lines=len(df_gptcot),
-            size=os.path.getsize(os.path.join(MOUNT_DIR, gptcot_filename)),
-            columns=list(df_gptcot.columns),
-            filtered=True,
-            file=gptcot_filename,
-            deleted=False,
-            original_file=params.file,
-        )
-        info_train = Metadata(
-            split_type="Train",
-            lines=len(df_train),
-            size=os.path.getsize(os.path.join(MOUNT_DIR, train_filename)),
-            columns=list(df_train.columns),
-            filtered=True,
-            file=train_filename,
-            deleted=False,
-            original_file=params.file,
-        )
-        info_val = Metadata(
-            split_type="Validation",
-            lines=len(df_val),
-            size=os.path.getsize(os.path.join(MOUNT_DIR, val_filename)),
-            columns=list(df_val.columns),
-            filtered=True,
-            file=val_filename,
-            deleted=False,
-            original_file=params.file,
-        )
-        info_test = Metadata(
-            split_type="Test",
-            lines=len(df_test),
-            size=os.path.getsize(os.path.join(MOUNT_DIR, test_filename)),
-            columns=list(df_test.columns),
-            filtered=True,
-            file=test_filename,
-            deleted=False,
-            original_file=params.file,
-        )
-        stub.file_metadata_queue.put_many(
-            [info_gptcot, info_train, info_val, info_test]
-        )
-
-        # commit to disk
-        vol_dataset.commit()
-
-        return {
-            "gptcot": len(df_gptcot),
-            "train": len(df_train),
-            "val": len(df_val),
-            "test": len(df_test),
-        }
-
-
-@stub.function()
-@modal.web_endpoint(label="status", method="GET")
 def get_status(mode):
-    return stub.status_tracker[mode].__dict__
+    return get_status_impl(mode)
 
 
-@stub.function()
-@modal.web_endpoint(label="kill", method="POST")
 def kill(mode):
-    if mode != "test" and mode != "gptcot":
-        raise ValueError(f"Invalid mode {mode}")
-    stub.status_tracker[mode + "kill"] = True
-    return True
-
-
-class GenerationTask:
-    excluded_abstracts = None
-    included_abstracts = None
-    gpt_cot = None
-    abstract_in_investigation = None
-    abstract_in_investigation_is_consumed = False
-
-    def __init__(
-        self,
-        mode,
-        num_excluded_abstracts,
-        num_included_abstracts,
-        preprompt,
-        prompt,
-        model,
-        model_seed,
-        include_dataset,
-        exclude_dataset,
-        gpt_cot_id=None,
-        few_shot_exclude=0,
-        few_shot_include=0,
-        abstract_in_investigation=None,
-        abstract_in_investigation_actual_value=None,
-    ):
-        self.mode = mode
-        if mode == "test":
-            self.result_queue = []
-            print(
-                f"Running test mode with {num_excluded_abstracts} excluded abstracts and {num_included_abstracts} included abstracts"
-            )
-        elif mode == "gptcot":
-            self.result_queue = []
-            print(
-                f"Running gptcot mode with {num_excluded_abstracts} excluded abstracts and {num_included_abstracts} included abstracts"
-            )
-            if gpt_cot_id is not None:
-                raise ValueError("gpt_cot_id should not be provided for gptcot mode")
-            if few_shot_exclude or few_shot_include:
-                raise ValueError(
-                    "few_shot_exclude or few_shot_include should not be provided for gptcot mode"
-                )
-        else:
-            raise ValueError(f"Invalid mode {mode}")
-
-        assert self.length_result_queue() == 0
-
-        if abstract_in_investigation and abstract_in_investigation_actual_value:
-            self.abstract_in_investigation = abstract_in_investigation
-            self.abstract_in_investigation_actual_value = (
-                abstract_in_investigation_actual_value
-            )
-
-        self.num_excluded_abstracts = num_excluded_abstracts
-        self.num_included_abstracts = num_included_abstracts
-
-        self.preprompt = preprompt
-        self.prompt = prompt
-        self.model = model
-        self.model_seed = model_seed
-
-        self.include_dataset = include_dataset
-        self.exclude_dataset = exclude_dataset
-
-        self.gpt_cot_id = gpt_cot_id
-        self.few_shot_exclude = few_shot_exclude
-        self.few_shot_include = few_shot_include
-        (
-            print(f"Using {self.gpt_cot_id} as gpt_cot_id")
-            if self.gpt_cot_id
-            else print("No gpt_cot_id provided")
-        )
-        (
-            print(
-                f"Using {few_shot_exclude} excluded fewshots and {few_shot_include} included fewshots"
-            )
-            if (few_shot_exclude or few_shot_include)
-            else print("No fewshots provided")
-        )
-        if self.gpt_cot_id and not (self.few_shot_exclude or self.few_shot_include):
-            raise ValueError("gpt_cot_id provided but no fewshots")
-        self.total = self.count()
-        if abstract_in_investigation or abstract_in_investigation_actual_value:
-            if self.num_excluded_abstracts + self.num_included_abstracts > 0:
-                raise ValueError(
-                    "abstract_in_investigation should not be provided when there are abstracts to process"
-                )
-        elif self.total == 0:
-            raise ValueError("No abstracts to process")
-
-    def count(self):
-        if self.abstract_in_investigation:
-            return 1 if not self.abstract_in_investigation_is_consumed else 0
-        return self.num_excluded_abstracts + self.num_included_abstracts
-
-    def is_generated_few_shot(self):
-        return bool(self.gpt_cot_id)
-
-    def needs_append_few_shots(self):
-        return self.few_shot_exclude or self.few_shot_include
-
-    def put_result_queue(self, result):
-        self.result_queue.append(result)
-
-    def get_all_result_queue(self):
-        return sorted(self.result_queue, key=lambda x: x["test_abstract"])
-
-    def length_result_queue(self):
-        return len(self.result_queue)
-
-    def load_abstracts(self):
-        import pandas as pd
-        import os
-        import numpy as np
-
-        if "seed_generator" not in self.__dict__:
-            raise ValueError("seed_generator not set")
-
-        # Load up volume files in memory
-        df_excluded = pd.read_csv(
-            os.path.join("/data", self.exclude_dataset), keep_default_na=False
-        )
-        if "Abstract" in df_excluded.columns:
-            excluded_abstracts = df_excluded["Abstract"].replace("", np.nan).dropna()
-        else:
-            excluded_abstracts = df_excluded["Content"].replace("", np.nan).dropna()
-
-        df_included = pd.read_csv(
-            os.path.join("/data", self.include_dataset), keep_default_na=False
-        )
-        if "Abstract" in df_included.columns:
-            included_abstracts = df_included["Abstract"].replace("", np.nan).dropna()
-        else:
-            included_abstracts = df_included["Content"].replace("", np.nan).dropna()
-        self.excluded_abstracts = excluded_abstracts.sample(
-            frac=1, random_state=self.seed_generator
-        )
-        self.included_abstracts = included_abstracts.sample(
-            frac=1, random_state=self.seed_generator
-        )
-        self.get_next_abstract_excluded = self.get_next_abstract_generator(True)
-        self.get_next_abstract_included = self.get_next_abstract_generator(False)
-
-    # generator
-    def get_next_abstract_generator(self, exclude):
-        if exclude:
-            for abstract in self.excluded_abstracts:
-                yield abstract
-        elif not exclude:
-            for abstract in self.included_abstracts:
-                yield abstract
-        else:
-            raise ValueError(
-                f"Invalid actual_value excluded={exclude}, this should never happen"
-            )
-
-    def get_abstracts(
-        self, actual_value="excluded", n=1, random_state=None, mode="testset"
-    ):
-        if self.abstract_in_investigation:
-            import pandas as pd
-
-            return pd.Series([self.abstract_in_investigation])
-        exclude = True if actual_value == "excluded" else False
-        if exclude:
-            samples = self.excluded_abstracts.sample(
-                n=n, random_state=random_state, replace=False
-            )
-            # Sample without replacement
-            self.excluded_abstracts = self.excluded_abstracts.drop(samples.index)
-            return samples
-        else:
-            samples = self.included_abstracts.sample(
-                n=n, random_state=random_state, replace=False
-            )
-            # Sample without replacement
-            self.included_abstracts = self.included_abstracts.drop(samples.index)
-            return samples
-
-    def get_cot_abstract_dataframe(
-        self, actual_value="excluded", n=1, seed_generator=None
-    ):
-        if self.gpt_cot is None:
-            raise ValueError("gpt_cot is not loaded")
-        return self.gpt_cot[self.gpt_cot["actual_value"] == actual_value].sample(
-            n=n, random_state=seed_generator, replace=False
-        )
-
-    def load_gpt_cot(self):
-        import pandas as pd
-        import os
-
-        if self.gpt_cot_id:
-            self.gpt_cot = pd.read_csv(
-                os.path.join(MOUNT_DIR_COT, f"cot_{self.gpt_cot_id}.csv")
-            )
-
-    def consume(self):
-        if self.abstract_in_investigation:
-            self.abstract_in_investigation_is_consumed = True
-            return self.abstract_in_investigation_actual_value
-        if self.num_excluded_abstracts > 0:
-            self.num_excluded_abstracts -= 1
-            return "excluded"
-        elif self.num_included_abstracts > 0:
-            self.num_included_abstracts -= 1
-            return "included"
-        else:
-            raise ValueError("No more abstracts to consume")
-
-    def default_rng(self, seed):
-        self.seed_generator = np.random.default_rng(seed)
-
-    def new_default_rng(self):
-        """
-        Used to ensure generation is consistent across runs for subtree operations
-        """
-        return np.random.default_rng(self.seed_generator.integers(0, 2**32 - 1))
-
-    def check_completion(self, i=0):
-        # Currently, failures not thrown during text generation do not stop execution.
-        if self.length_result_queue() != self.total:
-            print(
-                f"ERROR ### generation_task {i}, result_queue.len() != self.total, returning what's left anyways"
-            )
-
-    def cleanup(self):
-        self.excluded_abstracts = None
-        self.included_abstracts = None
-        self.gpt_cot = None
-        # remove all generators because they cannot be pickled
-        self.get_next_abstract_excluded = None
-        self.get_next_abstract_included = None
-
-
-class KillException(Exception):
-    pass
+    return kill_impl(mode)
 
 
 class Item(BaseModel):
@@ -706,13 +212,19 @@ def run_f(item: Item):
         generation_task.check_completion(i)
 
     from collections import defaultdict
-    total_result_queue = [result_raw for generation_task in generation_tasks for result_raw in generation_task.get_all_result_queue() ]
+
+    total_result_queue = [
+        result_raw
+        for generation_task in generation_tasks
+        for result_raw in generation_task.get_all_result_queue()
+    ]
     result_queue_dict = defaultdict(list)
     for result_raw in total_result_queue:
         result_queue_dict[result_raw["abstract_id"]].append(result_raw)
 
     for res_key in result_queue_dict:
         from collections import Counter
+
         res_tuple = result_queue_dict[res_key]
 
         # Aggregate stats
@@ -1206,20 +718,6 @@ async def gen(
     return generation_tasks
 
 
-# @stub.function(
-#     volumes={MOUNT_DIR: vol},
-# )
-# @modal.web_endpoint(label="ls", method="GET")
-# def ls():
-#     vol.reload()
-#     import glob
-
-#     return [
-#         {"name": os.path.basename(file), "size": os.path.getsize(file)}
-#         for file in glob.glob(f"{MOUNT_DIR}/*.csv")
-#     ]
-
-
 ### PARALLEL PROCESSING HELPERS ##########################################
 
 
@@ -1293,7 +791,7 @@ class Abstract:
             self.abstract = next(self.generation_task.get_next_abstract_included)
 
         seed_generator_few_shot = self.generation_task.new_default_rng()
-        
+
         self.abstract_id = hash(self.abstract)
 
         few_shot_text = ""
@@ -1454,105 +952,6 @@ def generate_unique_id():
     return unique_id
 
 
-@stub.function(
-    volumes={MOUNT_DIR: vol_dataset},
-)
-def create_subsets():
-    import os
-
-    # Clean all generated files
-    remove_files.local()
-
-    # Find all relevant files in directory
-    files = os.listdir(MOUNT_DIR)
-    files = [file for file in files if file.endswith(".csv")]
-
-    # split into train and test sets, use 800 for gptcot, 800 for train, 800 for validation, and the rest for testing
-    _ = list(create_subset.map(files))
-
-    vol_dataset.reload()
-    print(os.listdir(MOUNT_DIR))
-    return True
-
-
-@stub.function(
-    volumes={MOUNT_DIR: vol_dataset},
-)
-def create_subset(file):
-    import os
-    import pandas as pd
-    import random
-
-    random.seed(1337)
-
-    print("Processing ", file)
-    df = pd.read_csv(os.path.join(MOUNT_DIR, file), low_memory=False)
-    # remove .csv from end of filename using os
-    file = os.path.splitext(file)[0]
-    split = min(800, (len(df) - 400) // 3)
-
-    if split < 800:
-        split = len(df) // 2
-
-        train = df.sample(split, random_state=1337)
-        test = df.drop(train.index)
-
-        train.to_csv(
-            os.path.join(MOUNT_DIR, f"{file}_gen_train_{split}.csv"), index=False
-        )
-        print("Train saved as ", f"{file}_gen_train_{split}.csv")
-
-        test.to_csv(os.path.join(MOUNT_DIR, f"{file}_gen_test.csv"), index=False)
-        print("Test saved as ", f"{file}_gen_test.csv")
-
-        vol_dataset.commit()
-        return True
-
-    gptcot_set = df.sample(split, random_state=1337)
-    df = df.drop(gptcot_set.index)
-
-    train = df.sample(split, random_state=1337)
-    df = df.drop(train.index)
-
-    validation = df.sample(split, random_state=1337)
-    test = df.drop(validation.index)
-
-    gptcot_set.to_csv(
-        os.path.join(MOUNT_DIR, f"{file}_gen_gpt_cot_{split}.csv"), index=False
-    )
-    print("GPT CoT set saved as ", f"{file}_gen_gpt_cot_{split}.csv")
-
-    train.to_csv(os.path.join(MOUNT_DIR, f"{file}_gen_train_{split}.csv"), index=False)
-    print("Train saved as ", f"{file}_gen_train_{split}.csv")
-
-    validation.to_csv(
-        os.path.join(MOUNT_DIR, f"{file}_gen_validation_{split}.csv"), index=False
-    )
-    print("Validation saved as ", f"{file}_gen_validation_{split}.csv")
-
-    test.to_csv(os.path.join(MOUNT_DIR, f"{file}_gen_test.csv"), index=False)
-    print("Test saved as ", f"{file}_gen_test.csv")
-
-    vol_dataset.commit()
-    return True
-
-
-@stub.function(
-    volumes={MOUNT_DIR: vol_dataset},
-)
-def remove_files():
-    import os
-    import glob
-
-    glob_pattern = os.path.join(MOUNT_DIR, "*gen*")
-    files = glob.glob(glob_pattern)
-    print(files)
-    for file in files:
-        os.remove(os.path.join(MOUNT_DIR, file))
-    vol_dataset.commit()
-    return True
-
-
 @stub.local_entrypoint()
 def main():
-    create_subsets.remote()
+    print(stub.file_lock.get("lock"))
