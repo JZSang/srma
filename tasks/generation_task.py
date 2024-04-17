@@ -146,10 +146,10 @@ class GenerationTask:
     def get_next_abstract_generator(self, exclude):
         if exclude:
             for i,abstract in enumerate(self.excluded_abstracts):
-                yield abstract, i
+                yield abstract, "excluded_" + str(i)
         elif not exclude:
             for i,abstract in enumerate(self.included_abstracts):
-                yield abstract, i
+                yield abstract, "included_" + str(i)
         else:
             raise ValueError(
                 f"Invalid actual_value excluded={exclude}, this should never happen"
