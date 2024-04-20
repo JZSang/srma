@@ -13,7 +13,7 @@ vol_save_results = modal.Volume.persisted("srma-results")
 stub = modal.Stub(
     "srma-retool",
     image=modal.Image.debian_slim().pip_install(
-        ["google-generativeai", "pandas", "openai", "tiktoken"]
+        ["google-generativeai", "pandas", "openai", "tiktoken", "mistralai", "mistral-common", "fastapi==0.100.0"]
     ),
 )
 ### Producer-Consumer Queues

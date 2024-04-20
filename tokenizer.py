@@ -34,5 +34,10 @@ def calculate_tokens(params: Tokenizer):
         ret = {"llm_answer": len(encoding.encode(params.result["llm_answer"])), "prompt": len(encoding.encode(params.result["prompt"]))}
 
         return {**params.result, "token_counts": ret}
+    elif (
+        model == "open-mixtral-8x22b-2404"
+        or model == "mistral-large-2402"
+    ):
+        raise ValueError("Should not be needed")
     else:
         raise ValueError("Invalid model calculate tokens")

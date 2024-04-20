@@ -1,6 +1,5 @@
 import os
 from pydantic import BaseModel
-from fastapi import UploadFile, File
 import constants
 from modal_references import stub, vol_dataset
 

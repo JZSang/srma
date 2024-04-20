@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 
 # Typing
 from pydantic import BaseModel
-from fastapi import UploadFile, File, Body
+from fastapi import UploadFile, File
 
 # Source
 from modal_references import vol_dataset, vol_save_results, cot_vol, stub
@@ -20,6 +20,7 @@ from operations.kill import kill_impl, KillException
 from operations.status import get_status_impl
 from tasks.generation_task import GenerationTask
 from constants import (
+    DEFAULT_SECONDS_PER_REQUEST,
     MOUNT_DIR,
     MOUNT_DIR_COT,
     TOKENIZER,
@@ -33,6 +34,7 @@ FINAL_PROMPT = "{preprompt}\n{few_shot_text}\n# Abstract in investigation: \n{te
 
 UploadOperations = Literal["dataset_upload"]
 
+
 @stub.function()
 @modal.web_endpoint(label="router-upload", method="POST")
 async def router_upload(operation: UploadOperations, file: UploadFile = File(...)):
@@ -41,11 +43,15 @@ async def router_upload(operation: UploadOperations, file: UploadFile = File(...
     else:
         raise ValueError("Invalid operation")
 
+
 Operations = Literal["dataset_manage", "status", "kill"]
-class Routing(BaseModel):    
+
+
+class Routing(BaseModel):
     dataset_manage: DatasetManage = None
     status: str = None
     kill: str = None
+
 
 @stub.function()
 @modal.web_endpoint(label="router", method="POST")
@@ -60,6 +66,7 @@ async def router(routing: Routing, operation: Operations):
     else:
         raise ValueError("Invalid operation")
 
+
 async def dataset_upload(file: UploadFile = File(...)):
     if file.content_type != "text/csv":
         raise ValueError("File must be a CSV")
@@ -71,6 +78,7 @@ def dataset_manage(params: DatasetManage):
     ret = dataset_manage_wrapper.remote(params)
     return ret
 
+
 def get_status(mode):
     return get_status_impl(mode)
 
@@ -80,8 +88,8 @@ def kill(mode):
 
 
 class Item(BaseModel):
-    abstract_in_investigation: str = None
-    abstract_in_investigation_actual_value: str = None
+    abstract_in_investigation: Optional[str] = None
+    abstract_in_investigation_actual_value: Optional[str] = None
 
     include_samples: int
     exclude_samples: int
@@ -89,7 +97,7 @@ class Item(BaseModel):
     preprompt: str
     prompt: str
 
-    gpt_cot_id: str = None
+    gpt_cot_id: Optional[str] = None
     few_shot_exclude: int = 0
     few_shot_include: int = 0
 
@@ -98,6 +106,7 @@ class Item(BaseModel):
 
     seed: int = 1
     ensemble: int = 1
+    ensemble_threshold: Optional[int] = None
 
 
 class COTItem(BaseModel):
@@ -178,6 +187,17 @@ def run_f(item: Item):
     stub.status_tracker[mode + "kill"] = False
 
     generation_tasks: list[GenerationTask] = []
+
+    if item.ensemble_threshold == 0:
+        raise ValueError(
+            "Ensemble threshold cannot be 0, otherwise everything will be included"
+        )
+
+    # At least how many predicted_values are needed in order for it to be included? (We are being protective of sensitivity)
+    ensemble_threshold = item.ensemble_threshold or (
+        item.ensemble // 2 + item.ensemble % 2
+    )
+
     for model_seed in range(item.ensemble):
         generation_tasks.append(
             GenerationTask(
@@ -255,12 +275,15 @@ def run_f(item: Item):
             "prompt_total": prompt_token_count * item.ensemble,
         }
 
+        number_of_predictions_for_included = Counter(
+            [res["predicted_value"] for res in res_tuple]
+        )["included"]
+        is_included = number_of_predictions_for_included >= ensemble_threshold
+
         prompt = res_tuple[0]["prompt"]
         llm_answer = "\n---\n".join(appended_llm_answers)
         skipped = True if is_skipped else False
-        predicted_value = Counter(
-            [res["predicted_value"] for res in res_tuple]
-        ).most_common(1)[0][0]
+        predicted_value = "included" if is_included else "excluded"
         actual_value = res_tuple[0]["actual_value"]
         correct = predicted_value == actual_value
         error = str(res_tuple[index_of_skipped]["error"]) if is_skipped else None
@@ -304,6 +327,7 @@ def run_f(item: Item):
         "few_shot_exclude": item.few_shot_exclude,
         "few_shot_include": item.few_shot_include,
         "ensemble": item.ensemble,
+        "ensemble_threshold": ensemble_threshold,
     }
 
     save_final_results.spawn(final_results, time=int(time.time()))
@@ -503,6 +527,26 @@ def setup(model, model_seed):
             )
 
         return returned_model
+    elif model == "open-mixtral-8x22b-2404" or model == "mistral-large-2402":
+        from mistralai.async_client import MistralAsyncClient
+
+        client = MistralAsyncClient()
+
+        async def returned_model(prompt):
+            return (
+                (
+                    await client.chat(
+                        model=model,
+                        messages=generate_messages(model, prompt),
+                        random_seed=model_seed,
+                        max_tokens=MAX_COMPLETION_TOKENS,
+                    )
+                )
+                .choices[0]
+                .message.content
+            )
+
+        return returned_model
     else:
         raise ValueError("Invalid model setup model")
 
@@ -530,6 +574,24 @@ def calculate_tokens(model, prompt, max_token_response):
                 if key == "name":
                     num_tokens += tokens_per_name
         num_tokens += 3
+        num_tokens += max_token_response
+        return num_tokens
+    elif model == "open-mixtral-8x22b-2404" or model == "mistral-large-2402":
+        from mistral_common.protocol.instruct.messages import (
+            UserMessage,
+        )
+        from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
+        from mistral_common.tokens.instruct.normalize import ChatCompletionRequest
+
+        tokenizer_v3 = MistralTokenizer.v3()
+
+        tokenized = tokenizer_v3.encode_chat_completion(
+            ChatCompletionRequest(
+                messages=[UserMessage(content=prompt)],
+                model=model,
+            )
+        )
+        num_tokens = len(tokenized.tokens)
         num_tokens += max_token_response
         return num_tokens
     else:
@@ -565,6 +627,10 @@ def generate_messages(model, prompt):
         or model == "gpt-4-turbo-2024-04-09"
     ):
         return [{"role": "user", "content": prompt}]
+    elif model == "open-mixtral-8x22b-2404" or model == "mistral-large-2402":
+        from mistralai.models.chat_completion import ChatMessage
+
+        return [ChatMessage(role="user", content=prompt)]
     else:
         raise ValueError(f"Invalid model generate_messages {model}")
 
@@ -594,9 +660,6 @@ async def gen(
     logging.basicConfig(level=logging_level)
     logging.debug(f"Logging initialized at level {logging_level}")
 
-    seconds_to_sleep_each_loop = (
-        0.007  # 7 ms limits max throughput to 142 requests per second
-    )
     queue_of_requests_to_retry = asyncio.Queue()
     task_id_generator = task_id_generator_function()
 
@@ -623,6 +686,11 @@ async def gen(
         "max_requests_per_minute"
     ]
     max_tokens_per_minute = USAGE_LIMITS[generation_task.model]["max_tokens_per_minute"]
+    seconds_to_sleep_each_loop = (
+        (1 / USAGE_LIMITS[generation_task.model]["max_requests_per_second"]) + 0.001
+        if "max_requests_per_second" in USAGE_LIMITS[generation_task.model]
+        else DEFAULT_SECONDS_PER_REQUEST
+    )
     available_request_capacity = max_requests_per_minute
     available_token_capacity = max_tokens_per_minute
     last_update_time = time.time()
@@ -786,9 +854,13 @@ class Abstract:
         self.actual_value = self.generation_task.consume()
 
         if self.actual_value == "excluded":
-            self.abstract, self.abstract_id = next(self.generation_task.get_next_abstract_excluded)
+            self.abstract, self.abstract_id = next(
+                self.generation_task.get_next_abstract_excluded
+            )
         else:
-            self.abstract, self.abstract_id = next(self.generation_task.get_next_abstract_included)
+            self.abstract, self.abstract_id = next(
+                self.generation_task.get_next_abstract_included
+            )
 
         seed_generator_few_shot = self.generation_task.new_default_rng()
 
