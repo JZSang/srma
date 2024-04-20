@@ -68,13 +68,11 @@ async def dataset_manage_impl(params: DatasetManage):
                     original_file=file,
                 )
             )
-        import asyncio
-        asyncio.create_task(vol_dataset.commit.aio())
+        vol_dataset.commit()
 
         return True
     elif params.type == "ls":
         import os
-        import asyncio
 
         files: list[Metadata] = stub.file_metadata_queue.get_many(9999, block=False)
         if files:
@@ -91,7 +89,7 @@ async def dataset_manage_impl(params: DatasetManage):
                     data[file.file] = file.dict()
                 json.dump(data, f)
 
-            asyncio.create_task(vol_dataset.commit.aio())
+            vol_dataset.commit()
         with open(os.path.join(MOUNT_DIR, "metadata.json"), "r") as f:
             import json
 

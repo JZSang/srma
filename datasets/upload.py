@@ -43,8 +43,7 @@ async def dataset_upload_impl(content: bytes, filename: str):
     stub.file_metadata_queue.put(info)
 
     # 2. Commit
-    import asyncio
-    asyncio.create_task(vol_dataset.commit.aio())
+    vol_dataset.commit()
 
     # 3. Show preview
     return info
