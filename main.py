@@ -16,6 +16,8 @@ from fastapi import UploadFile, File
 from modal_references import vol_dataset, vol_save_results, cot_vol, stub
 from datasets.upload import dataset_upload_impl
 from datasets.manage import dataset_manage_wrapper, DatasetManage
+from models.helpers import generate_messages, setup_model
+from models.openai import chat_completions_create_params
 from operations.kill import kill_impl, KillException
 from operations.status import get_status_impl
 from tasks.generation_task import GenerationTask
@@ -27,6 +29,7 @@ from constants import (
     MAX_COMPLETION_TOKENS,
     USAGE_LIMITS,
 )
+from tokenizer import calculate_tokens
 
 # Prompt format
 FINAL_PROMPT = "{preprompt}\n{few_shot_text}\n# Abstract in investigation: \n{test_abstract}\n\n{prompt}\n"
@@ -462,140 +465,6 @@ async def gptcot(item: COTItem):
     }
 
 
-@stub.function()
-def setup(model, model_seed):
-    if model == "gemini-pro":
-        import google.generativeai as genai
-
-        genai.configure(api_key=os.environ["SERVICE_ACCOUNT_JSON"])
-        # Set up the model
-        generation_config = {
-            "temperature": 1.0,
-            "top_p": 1,
-            "top_k": 1,
-            "max_output_tokens": MAX_COMPLETION_TOKENS,
-        }
-
-        safety_settings = [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_ONLY_HIGH"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_ONLY_HIGH"},
-            {
-                "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                "threshold": "BLOCK_ONLY_HIGH",
-            },
-            {
-                "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-                "threshold": "BLOCK_ONLY_HIGH",
-            },
-        ]
-
-        # TODO: add seed
-        client = genai.GenerativeModel(
-            model_name=model,
-            generation_config=generation_config,
-            safety_settings=safety_settings,
-        )
-
-        async def returned_model(prompt):
-            return (
-                await client.generate_content_async(generate_messages(model, prompt))
-            ).text
-
-        return returned_model
-    elif (
-        model == "gpt-3.5-turbo"
-        or model == "gpt-4-0125-preview"
-        or model == "gpt-3.5-turbo-0125"
-        or model == "gpt-4-turbo-2024-04-09"
-    ):
-        from openai import AsyncOpenAI
-
-        client = AsyncOpenAI()
-
-        async def returned_model(prompt):
-            return (
-                (
-                    await client.chat.completions.create(
-                        messages=generate_messages(model, prompt),
-                        model=model,
-                        max_tokens=MAX_COMPLETION_TOKENS,
-                        seed=model_seed,
-                    )
-                )
-                .choices[0]
-                .message.content
-            )
-
-        return returned_model
-    elif model == "open-mixtral-8x22b-2404" or model == "mistral-large-2402":
-        from mistralai.async_client import MistralAsyncClient
-
-        client = MistralAsyncClient()
-
-        async def returned_model(prompt):
-            return (
-                (
-                    await client.chat(
-                        model=model,
-                        messages=generate_messages(model, prompt),
-                        random_seed=model_seed,
-                        max_tokens=MAX_COMPLETION_TOKENS,
-                    )
-                )
-                .choices[0]
-                .message.content
-            )
-
-        return returned_model
-    else:
-        raise ValueError("Invalid model setup model")
-
-
-def calculate_tokens(model, prompt, max_token_response):
-    if model == "gemini-pro":
-        # gemini doesn't limit by tokens
-        return 1
-    elif (
-        model == "gpt-3.5-turbo"
-        or model == "gpt-4-0125-preview"
-        or model == "gpt-3.5-turbo-0125"
-        or model == "gpt-4-turbo-2024-04-09"
-    ):
-        import tiktoken
-
-        tokens_per_message = 3
-        tokens_per_name = 1
-        encoding = tiktoken.get_encoding(TOKENIZER)
-        num_tokens = 0
-        for message in generate_messages(model, prompt):
-            num_tokens += tokens_per_message
-            for key, value in message.items():
-                num_tokens += len(encoding.encode(value))
-                if key == "name":
-                    num_tokens += tokens_per_name
-        num_tokens += 3
-        num_tokens += max_token_response
-        return num_tokens
-    elif model == "open-mixtral-8x22b-2404" or model == "mistral-large-2402":
-        from mistral_common.protocol.instruct.messages import (
-            UserMessage,
-        )
-        from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
-        from mistral_common.tokens.instruct.normalize import ChatCompletionRequest
-
-        tokenizer_v3 = MistralTokenizer.v3()
-
-        tokenized = tokenizer_v3.encode_chat_completion(
-            ChatCompletionRequest(
-                messages=[UserMessage(content=prompt)],
-                model=model,
-            )
-        )
-        num_tokens = len(tokenized.tokens)
-        num_tokens += max_token_response
-        return num_tokens
-    else:
-        raise ValueError("Invalid model calculate tokens")
 
 
 def is_excluded(text, test_abstract):
@@ -615,24 +484,6 @@ def is_excluded(text, test_abstract):
         raise Exception(
             f"Invalid case: LLM did not print an answer: {text} {test_abstract}"
         )
-
-
-def generate_messages(model, prompt):
-    if model == "gemini-pro":
-        return [prompt]
-    elif (
-        model == "gpt-3.5-turbo"
-        or model == "gpt-4-0125-preview"
-        or model == "gpt-3.5-turbo-0125"
-        or model == "gpt-4-turbo-2024-04-09"
-    ):
-        return [{"role": "user", "content": prompt}]
-    elif model == "open-mixtral-8x22b-2404" or model == "mistral-large-2402":
-        from mistralai.models.chat_completion import ChatMessage
-
-        return [ChatMessage(role="user", content=prompt)]
-    else:
-        raise ValueError(f"Invalid model generate_messages {model}")
 
 
 @stub.function(
@@ -940,6 +791,23 @@ class Abstract:
             self.generation_task.model, self.final_prompt, MAX_COMPLETION_TOKENS
         )
 
+    async def single_abstract_batch(
+        self
+    ):
+        if self.generation_task.model not in ["gpt-3.5-turbo", "gpt-4-0125-preview", "gpt-4-turbo-2024-04-09", "gpt-3.5-turbo-0125"]:
+            raise ValueError("Invalid model for batch processing")
+
+        line = {
+            "custom_id": self.abstract_id,
+            "method": "POST",
+            "url": "/v1/chat/completions",
+            "body": chat_completions_create_params(
+                self.generation_task.model, self.final_prompt, self.generation_task.model_seed
+            )
+        }
+        
+        self.generation_task.put_result_queue(line)
+    
     async def single_abstract(
         self, retry_queue: asyncio.Queue, status_tracker: StatusTracker
     ):
@@ -949,7 +817,7 @@ class Abstract:
         try:
             ###### BUSINESS
             # Setup the model
-            model_async = setup.local(
+            model_async = setup_model(
                 self.generation_task.model, self.generation_task.model_seed
             )
             import asyncio
