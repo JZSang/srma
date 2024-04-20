@@ -314,12 +314,15 @@ def run_f(item: Item):
     print("Completed, status: ", status_tracker.__dict__)
     end_time = time.time()
     print("Time taken: ", end_time - start_time)
+    
+    unique_id = generate_unique_id()
 
     final_results = {
         "model": item.model,
         "results": results,
         "total_correct": correct_count,
         "total": completed_count,
+        "id": unique_id,
         "total_skipped": skipped_count,
         "status_tracker": status_tracker.__dict__,
         "include_dataset": item.include_dataset,
