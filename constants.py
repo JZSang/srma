@@ -41,6 +41,7 @@ WORKSPACE = "jzsang"
 
 ### General dataset mounting
 MOUNT_DIR = "/data"
+SAVE_BATCH_MOUNT_DIR = "/batches"
 
 ### GPTCoT storage
 MOUNT_DIR_COT = "/cot"

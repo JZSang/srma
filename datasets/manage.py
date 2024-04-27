@@ -2,7 +2,7 @@ import asyncio
 
 from pydantic import BaseModel
 
-from modal_references import stub, vol_dataset
+from modal_references import stub, vol_dataset, file_lock, file_metadata_queue
 from datasets.upload import Metadata
 from constants import MOUNT_DIR
 
@@ -16,16 +16,9 @@ class DatasetManage(BaseModel):
 
     splits: tuple[int, int, int, int] = None
 
-@stub.function(volumes={MOUNT_DIR: vol_dataset})
+@stub.function(volumes={MOUNT_DIR: vol_dataset}, concurrency_limit=1)
 async def dataset_manage_wrapper(params: DatasetManage):
-    # Pause operation until lock is released
-    while stub.file_lock.get("lock", False):
-        await asyncio.sleep(0.1)
-    stub.file_lock["lock"] = True
-    try:
-        ret = await dataset_manage_impl(params)
-    finally:
-        stub.file_lock["lock"] = False
+    ret = await dataset_manage_impl(params)
     return ret
 
 
@@ -56,7 +49,7 @@ async def dataset_manage_impl(params: DatasetManage):
             os.remove(os.path.join(MOUNT_DIR, file))
             # Make sure there's if statement to check deleted
             # Make sure that deleted instances throw an error
-            stub.file_metadata_queue.put(
+            file_metadata_queue.put(
                 Metadata(
                     split_type="Raw",
                     lines=0,
@@ -74,7 +67,7 @@ async def dataset_manage_impl(params: DatasetManage):
     elif params.type == "ls":
         import os
 
-        files: list[Metadata] = stub.file_metadata_queue.get_many(9999, block=False)
+        files: list[Metadata] = file_metadata_queue.get_many(9999, block=False)
         if files:
             vol_dataset.reload()
             with open(os.path.join(MOUNT_DIR, "metadata.json"), "r") as f:
@@ -104,7 +97,7 @@ async def dataset_manage_impl(params: DatasetManage):
         df = df.dropna(subset=[params.column])
         df.to_csv(os.path.join(MOUNT_DIR, params.file), index=False)
 
-        stub.file_metadata_queue.put(
+        file_metadata_queue.put(
             Metadata(
                 lines=len(df),
                 size=os.path.getsize(os.path.join(MOUNT_DIR, params.file)),
@@ -200,7 +193,7 @@ async def dataset_manage_impl(params: DatasetManage):
             deleted=False,
             original_file=params.file,
         )
-        stub.file_metadata_queue.put_many(
+        file_metadata_queue.put_many(
             [info_gptcot, info_train, info_val, info_test]
         )
 

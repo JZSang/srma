@@ -1,4 +1,4 @@
-from modal_references import stub
+from modal_references import status_tracker_global_dictionary
 
 
 class KillException(Exception):
@@ -9,5 +9,5 @@ class KillException(Exception):
 def kill_impl(mode):
     if mode != "test" and mode != "gptcot":
         raise ValueError(f"Invalid mode {mode}")
-    stub.status_tracker[mode + "kill"] = True
+    status_tracker_global_dictionary[mode + "kill"] = True
     return True

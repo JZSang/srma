@@ -1,11 +1,11 @@
 # Modal
+import dataclasses
 import modal
 
 # System
-import os
 import time
 import asyncio
-from typing import Literal, Optional, Union
+from typing import Literal, Union
 from dataclasses import dataclass, field
 
 # Typing
@@ -13,23 +13,35 @@ from pydantic import BaseModel
 from fastapi import UploadFile, File
 
 # Source
-from modal_references import vol_dataset, vol_save_results, cot_vol, stub
+from modal_references import (
+    vol_dataset,
+    cot_vol,
+    stub,
+    status_tracker_global_dictionary,
+    vol_save_intermediate_batches,
+    vol_save_results
+)
 from datasets.upload import dataset_upload_impl
 from datasets.manage import dataset_manage_wrapper, DatasetManage
-from models.helpers import generate_messages, setup_model
+from models.helpers import setup_model, calculate_tokens
 from models.openai import chat_completions_create_params
 from operations.kill import kill_impl, KillException
 from operations.status import get_status_impl
+from tasks.abstract_resource import AbstractRunResource
+from tasks.batch import CheckAndUpdateBatches, LoadBatch, LoadBatches, check_and_update_batches_impl, load_batch, load_batches
+from tasks.evaluation import is_excluded
+from tasks.files import save_final_results
 from tasks.generation_task import GenerationTask
 from constants import (
     DEFAULT_SECONDS_PER_REQUEST,
     MOUNT_DIR,
     MOUNT_DIR_COT,
-    TOKENIZER,
     MAX_COMPLETION_TOKENS,
+    SAVE_BATCH_MOUNT_DIR,
     USAGE_LIMITS,
 )
-from tokenizer import calculate_tokens
+from tasks.run_test import Item, finalize_results
+from utils.id import generate_unique_id
 
 # Prompt format
 FINAL_PROMPT = "{preprompt}\n{few_shot_text}\n# Abstract in investigation: \n{test_abstract}\n\n{prompt}\n"
@@ -47,16 +59,19 @@ async def router_upload(operation: UploadOperations, file: UploadFile = File(...
         raise ValueError("Invalid operation")
 
 
-Operations = Literal["dataset_manage", "status", "kill"]
+Operations = Literal["dataset_manage", "status", "kill", "load_batches", "check_and_update_batches", "load_batch"]
 
 
 class Routing(BaseModel):
     dataset_manage: DatasetManage = None
     status: str = None
     kill: str = None
+    load_batches: LoadBatches = None
+    load_batch: LoadBatch = None
+    check_and_update_batches: CheckAndUpdateBatches = None
 
 
-@stub.function()
+@stub.function(volumes={SAVE_BATCH_MOUNT_DIR: vol_save_results})
 @modal.web_endpoint(label="router", method="POST")
 async def router(routing: Routing, operation: Operations):
     print("CANONICAL-API-LINE: ", operation, routing.dict())
@@ -66,6 +81,12 @@ async def router(routing: Routing, operation: Operations):
         return get_status(routing.status)
     elif operation == "kill":
         return kill(routing.kill)
+    elif operation == "load_batches":
+        return load_batches.remote(routing.load_batches)
+    elif operation == "check_and_update_batches":
+        return check_and_update_batches(routing.check_and_update_batches)
+    elif operation == "load_batch":
+        return load_batch.local(routing.load_batch)
     else:
         raise ValueError("Invalid operation")
 
@@ -90,26 +111,12 @@ def kill(mode):
     return kill_impl(mode)
 
 
-class Item(BaseModel):
-    abstract_in_investigation: Optional[str] = None
-    abstract_in_investigation_actual_value: Optional[str] = None
-
-    include_samples: int
-    exclude_samples: int
-    model: str = "gemini-pro"
-    preprompt: str
-    prompt: str
-
-    gpt_cot_id: Optional[str] = None
-    few_shot_exclude: int = 0
-    few_shot_include: int = 0
-
-    include_dataset: str
-    exclude_dataset: str
-
-    seed: int = 1
-    ensemble: int = 1
-    ensemble_threshold: Optional[int] = None
+def check_and_update_batches(params: CheckAndUpdateBatches):
+    call = check_and_update_batches_impl.spawn(params)
+    function_id = call.object_id
+    return {
+        "function_id": function_id
+    }
 
 
 class COTItem(BaseModel):
@@ -123,23 +130,6 @@ class COTItem(BaseModel):
     exclude_dataset: str
 
     seed: int = 1
-
-
-class Result(BaseModel):
-    prompt: str
-    llm_answer: Union[str, None]
-
-    correct: bool
-    skipped: bool
-
-    error: Union[str, None] = None
-    predicted_value: Union[str, None] = ""
-    predicted_values: list[str] = []
-    actual_value: str = ""
-    test_abstract: str = ""
-
-    token_counts: dict = {}
-
 
 class COTResult(BaseModel):
     prompt: str
@@ -175,19 +165,40 @@ def check_test(function_id=None):
     except:
         raise ValueError("Invalid state")
 
-
-@stub.function(timeout=60 * 60)
-def run_f(item: Item):
+@stub.function(
+    timeout=60 * 60,
+    secrets=[
+        modal.Secret.from_name("mongo-db-atlas-srma"),
+        modal.Secret.from_name("srma-openai"),
+    ],
+    volumes={MOUNT_DIR: vol_save_intermediate_batches},
+)
+async def run_f(item: Item):
     import time
 
+    if item.is_batch:
+        # prewarm db
+        from pymongo.mongo_client import MongoClient
+        import os
+
+        uri = (
+            "mongodb+srv://dotsangjason:"
+            + os.environ["MONGO_PASSWORD"]
+            + "@srma.nhlebom.mongodb.net/?retryWrites=true&w=majority&appName=SRMA"
+        )
+        # Create a new client and connect to the server
+        mongo_client = MongoClient(uri)
+        # Send a ping to confirm a successful connection
+        mongo_client.admin.command("ping")
+        print("Successful MongoDB connection, proceeding with batch processing")
+
+    special_id = generate_unique_id()
+    special_id = f"test_ensemble_{special_id}"
+
     start_time = time.time()
-    correct_count = 0
-    completed_count = 0
-    skipped_count = 0
-    results = []
     mode = "test"
 
-    stub.status_tracker[mode + "kill"] = False
+    status_tracker_global_dictionary[mode + "kill"] = False
 
     generation_tasks: list[GenerationTask] = []
 
@@ -223,133 +234,116 @@ def run_f(item: Item):
 
     try:
         generation_tasks = gen.remote(
-            item.seed,
-            generation_tasks,
+            seed=item.seed, generation_tasks=generation_tasks, is_batch=item.is_batch
         )
     except KillException:
-        stub.status_tracker[mode + "kill"] = False
-
-    import tiktoken
+        status_tracker_global_dictionary[mode + "kill"] = False
 
     for i, generation_task in enumerate(generation_tasks):
         generation_task.check_completion(i)
 
-    from collections import defaultdict
+    ### Batch processing
+    if item.is_batch:
+        from pathlib import Path
+        import tempfile
 
-    total_result_queue = [
-        result_raw
-        for generation_task in generation_tasks
-        for result_raw in generation_task.get_all_result_queue()
-    ]
-    result_queue_dict = defaultdict(list)
-    for result_raw in total_result_queue:
-        result_queue_dict[result_raw["abstract_id"]].append(result_raw)
+        files: list[Path] = []
+        number_of_workloads = 0
+        for generation_task in generation_tasks:
+            generation_task_results = generation_task.get_all_result_queue()
+            number_of_workloads += generation_task.length_result_queue()
+            with tempfile.NamedTemporaryFile(
+                delete=False, suffix=".jsonl", prefix="generation_task_"
+            ) as tmp:
+                import json
 
-    for res_key in result_queue_dict:
-        from collections import Counter
+                jsonl = "\n".join([json.dumps(result["line"]) for result in generation_task_results])
+                tmp.write(jsonl.encode())
+                files.append([
+                    Path(tmp.name), 
+                    list(map(lambda x: x["return"], generation_task_results))
+                ])
 
-        res_tuple = result_queue_dict[res_key]
+        print("Batched files to upload:", list(map(lambda x: x[0], files)))
+        print("Total number of workloads: ", number_of_workloads)
+        from openai import AsyncOpenAI
+        import asyncio
+        import json
 
-        # Aggregate stats
-        is_skipped = 0
-        index_of_skipped = -1
+        client = AsyncOpenAI()
 
-        for i, res in enumerate(res_tuple):
-            if res["skipped"]:
-                is_skipped = 1
-                index_of_skipped = i
-                break
-        skipped_count += is_skipped
-        completed_count += not is_skipped
+        async def batch_and_save_file(file: Path, results: list[dict]):
 
-        # Token counting
-        encoding = tiktoken.get_encoding(TOKENIZER)
-        appended_llm_answers = [res.get("llm_answer") or "" for res in res_tuple]
-        llm_answers_token_counts = sum(
-            [
-                len(encoding.encode(appended_llm_answer))
-                for appended_llm_answer in appended_llm_answers
-            ]
-        )
-        prompt_token_count = len(encoding.encode(res["prompt"]))
-        token_counts = {
-            "llm_answer": llm_answers_token_counts,
-            "prompt": prompt_token_count,
-            "prompt_total": prompt_token_count * item.ensemble,
-        }
-
-        number_of_predictions_for_included = Counter(
-            [res["predicted_value"] for res in res_tuple]
-        )["included"]
-        is_included = number_of_predictions_for_included >= ensemble_threshold
-
-        prompt = res_tuple[0]["prompt"]
-        llm_answer = "\n---\n".join(appended_llm_answers)
-        skipped = True if is_skipped else False
-        predicted_value = "included" if is_included else "excluded"
-        actual_value = res_tuple[0]["actual_value"]
-        correct = predicted_value == actual_value
-        error = str(res_tuple[index_of_skipped]["error"]) if is_skipped else None
-        test_abstract = res_tuple[0]["test_abstract"]
-        token_counts = token_counts
-        predicted_values = [res["predicted_value"] for res in res_tuple]
-
-        correct_count += correct if not is_skipped else 0
-
-        results.append(
-            Result(
-                prompt=prompt,
-                llm_answer=llm_answer,
-                correct=correct,
-                skipped=skipped,
-                predicted_value=predicted_value,
-                actual_value=actual_value,
-                error=error,
-                test_abstract=test_abstract,
-                token_counts=token_counts,
-                predicted_values=predicted_values,
+            response = await client.files.create(file=file, purpose="batch")
+            input_file_id = response.id
+            batch = await client.batches.create(
+                input_file_id=input_file_id,
+                endpoint="/v1/chat/completions",
+                completion_window="24h",
+                metadata={"ensemble_id": special_id},
             )
-        )
+            batch_id = batch.id
+            
+            # Save the intermediate instantiations of AbstractBatch
+            with open(f"{MOUNT_DIR}/intermediate_{batch_id}.json", "w") as f:
+                json.dump(results, f)
+            
+            print(f"Created batch for file {input_file_id} with batch id {batch_id}. Also saved intermediate results for collation upon completion.")
+            return batch
 
-    status_tracker: StatusTracker = stub.status_tracker[mode]
-    stub.status_tracker[mode] = StatusTracker(mode)
+        batches = await asyncio.gather(*[batch_and_save_file(file[0], file[1]) for file in files])
+        individual_collection = mongo_client.get_database("SRMA").get_collection(
+            "individual_batch_status"
+        )
+        individual_collection.insert_many([batch.to_dict() for batch in batches])
+        print(f"""Added the OpenAI batches {", ".join(map(lambda x: x.id, batches))}""")
+
+        collection = mongo_client.get_database("SRMA").get_collection("run_batched")
+        collection.insert_one(
+            {
+                "ensemble_id": special_id,
+                "batches": [batch.id for batch in batches],
+                "created_at": int(time.time()),
+                "status": batches[0].status,
+                "item": item.__dict__,
+                "ensemble_threshold": ensemble_threshold,
+                "data_file_name": None
+            }
+        )
+        
+        vol_save_intermediate_batches.commit()
+        return True
+
+    ### Sync processing
+    finalized_results = finalize_results(
+        [
+            result_raw
+            for generation_task in generation_tasks
+            for result_raw in generation_task.get_all_result_queue()
+        ],
+        item,
+        ensemble_threshold
+    )
+
+    status_tracker: StatusTracker = status_tracker_global_dictionary[mode]
+    status_tracker_global_dictionary[mode] = StatusTracker(mode)
 
     print("Completed, status: ", status_tracker.__dict__)
     end_time = time.time()
     print("Time taken: ", end_time - start_time)
-    
-    unique_id = generate_unique_id()
-    unique_id = f"test_{unique_id}"
 
-    final_results = {
-        "model": item.model,
-        "results": results,
-        "total_correct": correct_count,
-        "total": completed_count,
-        "id": unique_id,
-        "total_skipped": skipped_count,
+    ret = {
+        # Overlay inputs
+        **item.model_dump(),
+        
+        # Overlay finalized results (may overwrite some things in item, that's ok)
+        **dataclasses.asdict(finalized_results),
         "status_tracker": status_tracker.__dict__,
-        "include_dataset": item.include_dataset,
-        "exclude_dataset": item.exclude_dataset,
-        "few_shot_exclude": item.few_shot_exclude,
-        "few_shot_include": item.few_shot_include,
-        "ensemble": item.ensemble,
-        "ensemble_threshold": ensemble_threshold,
     }
 
-    save_final_results.spawn(final_results, time=int(time.time()))
+    save_final_results.spawn(ret, unique_id=special_id)
 
-    return final_results
-
-
-@stub.function(volumes={MOUNT_DIR: vol_save_results})
-async def save_final_results(final_results, time):
-    final_results["results"] = [result.dict() for result in final_results["results"]]
-    with open(os.path.join(MOUNT_DIR, f"results_{time}.json"), "w") as f:
-        import json
-
-        json.dump(final_results, f)
-    vol_save_results.commit()
+    return ret
 
 
 @stub.function(volumes={MOUNT_DIR_COT: cot_vol}, timeout=600)
@@ -361,7 +355,7 @@ async def gptcot(item: COTItem):
     results = []
     mode = "gptcot"
 
-    stub.status_tracker[mode + "kill"] = False
+    status_tracker_global_dictionary[mode + "kill"] = False
 
     num_excluded_abstracts = item.exclude_samples
     num_included_abstracts = item.include_samples
@@ -386,7 +380,7 @@ async def gptcot(item: COTItem):
             generation_task,
         )
     except KillException:
-        stub.status_tracker[mode + "kill"] = False
+        status_tracker_global_dictionary[mode + "kill"] = False
 
     if isinstance(generation_task, list):
         generation_task = generation_task[0]
@@ -413,8 +407,8 @@ async def gptcot(item: COTItem):
             )
         )
 
-    status_tracker = stub.status_tracker[mode]
-    stub.status_tracker[mode] = StatusTracker(mode)
+    status_tracker = status_tracker_global_dictionary[mode]
+    status_tracker_global_dictionary[mode] = StatusTracker(mode)
 
     unique_id = generate_unique_id()
 
@@ -469,27 +463,6 @@ async def gptcot(item: COTItem):
     }
 
 
-
-
-def is_excluded(text, test_abstract):
-    if text is None:
-        raise Exception(f"Invalid case: LLM did not print an answer: {test_abstract}")
-    # search area to the very end, maybe about 100 characters
-    text = text[-100:]
-    if "XXX" in text and "YYY" in text:
-        raise Exception(
-            f"Invalid case: Impossible to decide LLM's answer: {text} {test_abstract}"
-        )
-    elif "XXX" in text:
-        return "excluded"
-    elif "YYY" in text:
-        return "included"
-    else:
-        raise Exception(
-            f"Invalid case: LLM did not print an answer: {text} {test_abstract}"
-        )
-
-
 @stub.function(
     volumes={MOUNT_DIR: vol_dataset, MOUNT_DIR_COT: cot_vol},
     secrets=[
@@ -503,6 +476,7 @@ def is_excluded(text, test_abstract):
 async def gen(
     seed: int,
     generation_tasks: Union[GenerationTask, list[GenerationTask]],
+    is_batch: bool = False,
 ):
     import asyncio
     import logging
@@ -515,11 +489,6 @@ async def gen(
     logging.basicConfig(level=logging_level)
     logging.debug(f"Logging initialized at level {logging_level}")
 
-    queue_of_requests_to_retry = asyncio.Queue()
-    task_id_generator = task_id_generator_function()
-
-    next_request = None  # variable to hold the next request to call
-
     for generation_task in generation_tasks:
         ### SLOW Reading from disk
         cot_vol.reload()
@@ -527,6 +496,29 @@ async def gen(
         generation_task.load_abstracts()
         generation_task.load_gpt_cot()
         ### SLOW Reading from disk
+
+    task_id_generator = task_id_generator_function()
+
+    if is_batch:
+        # Batch processing
+        for i, generation_task in enumerate(generation_tasks):
+            while True:
+                abstract = AbstractBatch(
+                    task_id=next(task_id_generator),
+                    generation_task=generation_task,
+                )
+                abstract.setup()
+                abstract.single_abstract_batch()
+
+                if not generation_task.count():
+                    break
+            generation_task.cleanup()
+            logging.info(f"Generation task {i} completed")
+        return generation_tasks
+
+    queue_of_requests_to_retry = asyncio.Queue()
+
+    next_request = None  # variable to hold the next request to call
 
     i = 0
     generation_task = generation_tasks[i]
@@ -560,7 +552,7 @@ async def gen(
                 logging.info(
                     f"Number of prompts left in generation_task {i}: {generation_task.count()}"
                 )
-                next_request = Abstract(
+                next_request = AbstractSync(
                     task_id=next(task_id_generator),
                     generation_task=generation_task,
                     attempts_left=3,
@@ -607,7 +599,7 @@ async def gen(
         if status_tracker.num_tasks_in_progress <= 0:
             break
 
-        will_die = stub.status_tracker[generation_task.mode + "kill"]
+        will_die = status_tracker_global_dictionary[generation_task.mode + "kill"]
         if will_die:
             raise KillException("Killed")
         # main loop sleeps briefly so concurrent tasks can run
@@ -635,7 +627,7 @@ async def gen(
             f"{status_tracker.num_rate_limit_errors} rate limit errors received. Consider running at a lower rate."
         )
 
-    stub.status_tracker[generation_task.mode] = status_tracker
+    status_tracker_global_dictionary[generation_task.mode] = status_tracker
 
     generation_task.cleanup()
     return generation_tasks
@@ -661,35 +653,34 @@ class StatusTracker:
     def start(self):
         self.num_tasks_started += 1
         self.num_tasks_in_progress += 1
-        stub.status_tracker[self.mode] = self
+        status_tracker_global_dictionary[self.mode] = self
 
     def error(self):
         self.num_other_errors += 1
-        stub.status_tracker[self.mode] = self
+        status_tracker_global_dictionary[self.mode] = self
 
     def fail(self):
         self.num_tasks_in_progress -= 1
         self.num_tasks_failed += 1
-        stub.status_tracker[self.mode] = self
+        status_tracker_global_dictionary[self.mode] = self
 
     def success(self):
         self.num_tasks_in_progress -= 1
         self.num_tasks_succeeded += 1
-        stub.status_tracker[self.mode] = self
+        status_tracker_global_dictionary[self.mode] = self
 
 
-@dataclass
+@dataclass(kw_only=True)
 class Abstract:
     task_id: int
-    attempts_left: int
     generation_task: GenerationTask
 
     actual_value: str = None
     final_prompt: str = None
-    result: list = field(default_factory=list)
     token_consumption: int = 0
     abstract: str = ""
     abstract_id: int = 1
+    index_cao: str = "no_cao_index"
 
     def sample_cot_abstract(self, actual_value, seed_generator, n=1):
         searchable_abstracts = self.generation_task.get_cot_abstract_dataframe(
@@ -709,11 +700,11 @@ class Abstract:
         self.actual_value = self.generation_task.consume()
 
         if self.actual_value == "excluded":
-            self.abstract, self.abstract_id = next(
+            self.abstract, self.abstract_id, self.index_cao = next(
                 self.generation_task.get_next_abstract_excluded
             )
         else:
-            self.abstract, self.abstract_id = next(
+            self.abstract, self.abstract_id, self.index_cao = next(
                 self.generation_task.get_next_abstract_included
             )
 
@@ -795,36 +786,39 @@ class Abstract:
             self.generation_task.model, self.final_prompt, MAX_COMPLETION_TOKENS
         )
 
-    async def single_abstract_batch(
-        self
-    ):
-        if self.generation_task.model not in ["gpt-3.5-turbo", "gpt-4-0125-preview", "gpt-4-turbo-2024-04-09", "gpt-3.5-turbo-0125"]:
-            raise ValueError("Invalid model for batch processing")
+    def get_metadata(self):
+        return AbstractRunResource(
+            prompt=self.final_prompt,
+            actual_value=self.actual_value,
+            test_abstract=self.abstract,
+            abstract_id=self.abstract_id,
+            index_cao=self.index_cao,
+            skipped=None,
+            correct=None,
+            predicted_value=None,
+            llm_answer=None,
+            error=None,
+        )
 
-        line = {
-            "custom_id": self.abstract_id,
-            "method": "POST",
-            "url": "/v1/chat/completions",
-            "body": chat_completions_create_params(
-                self.generation_task.model, self.final_prompt, self.generation_task.model_seed
-            )
-        }
-        
-        self.generation_task.put_result_queue(line)
-    
+
+@dataclass(kw_only=True)
+class AbstractSync(Abstract):
+    attempts_left: int
+    result: list = field(default_factory=list)
+
     async def single_abstract(
         self, retry_queue: asyncio.Queue, status_tracker: StatusTracker
     ):
         if self.attempts_left < 0:
             raise ValueError("attempts_left should never be negative")
         error = None
+        ###### BUSINESS
+        # Setup the model
+        model_async = setup_model(
+            self.generation_task.model, self.generation_task.model_seed
+        )
+        import asyncio
         try:
-            ###### BUSINESS
-            # Setup the model
-            model_async = setup_model(
-                self.generation_task.model, self.generation_task.model_seed
-            )
-            import asyncio
 
             # Model produces response
             llm_answer = await asyncio.wait_for(
@@ -846,34 +840,67 @@ class Abstract:
                 retry_queue.put_nowait(self)
             else:
                 self.generation_task.put_result_queue(
-                    {
-                        "skipped": True,
-                        "prompt": self.final_prompt,
-                        "error": [str(e) for e in self.result],
-                        "correct": False,
-                        "predicted_value": "fail",
-                        "actual_value": "fail",
-                        "llm_answer": "fail",
-                        "test_abstract": self.abstract,
-                        "abstract_id": self.abstract_id,
-                    }
+                    self.get_metadata(error=[str(e) for e in self.result]).__dict__
                 )
                 status_tracker.fail()
         else:
             self.generation_task.put_result_queue(
-                {
-                    "skipped": False,
-                    "prompt": self.final_prompt,
-                    "error": None,
-                    "correct": predicted_value == self.actual_value,
-                    "predicted_value": predicted_value,
-                    "actual_value": self.actual_value,
-                    "llm_answer": llm_answer,
-                    "test_abstract": self.abstract,
-                    "abstract_id": self.abstract_id,
-                }
+                self.get_metadata(
+                    error=None,
+                    predicted_value=predicted_value,
+                    llm_answer=llm_answer,
+                ).__dict__
             )
             status_tracker.success()
+
+    def get_metadata(self, error=None, predicted_value=None, llm_answer=None):
+        resource = super().get_metadata()
+        if not error:
+            resource.finalize(
+                skipped=False,
+                correct=predicted_value == self.actual_value,
+                predicted_value=predicted_value,
+                llm_answer=llm_answer,
+                error=None,
+            )
+            return resource
+        
+        resource.finalize(
+            skipped=True,
+            correct=False,
+            predicted_value="fail",
+            llm_answer="fail",
+            error=error,
+        )
+
+        return resource
+
+@dataclass(kw_only=True)
+class AbstractBatch(Abstract):
+
+    def single_abstract_batch(self):
+        if self.generation_task.model not in [
+            "gpt-3.5-turbo",
+            "gpt-4-0125-preview",
+            "gpt-4-turbo-2024-04-09",
+            "gpt-3.5-turbo-0125",
+        ]:
+            raise ValueError("Invalid model for batch processing")
+
+        line = {
+            "custom_id": self.abstract_id,
+            "method": "POST",
+            "url": "/v1/chat/completions",
+            "body": chat_completions_create_params(
+                self.generation_task.model,
+                self.final_prompt,
+                self.generation_task.model_seed,
+            ),
+        }
+
+        self.generation_task.put_result_queue(
+            {"line": line, "return": self.get_metadata().__dict__}
+        )
 
 
 ##### GENERAL HELPERS ######################################################
@@ -886,14 +913,6 @@ def task_id_generator_function():
         yield task_id
         task_id += 1
 
-
-def generate_unique_id():
-    import uuid
-
-    unique_id = str(uuid.uuid4())[:8]
-    return unique_id
-
-
 @stub.local_entrypoint()
 def main():
-    print(stub.file_lock.get("lock"))
+    pass

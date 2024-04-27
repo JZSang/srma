@@ -1,5 +1,5 @@
 
-from modal_references import stub
+from modal_references import status_tracker_global_dictionary
 
 def get_status_impl(mode):
-    return stub.status_tracker[mode].__dict__
+    return status_tracker_global_dictionary[mode].__dict__

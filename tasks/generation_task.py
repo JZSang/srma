@@ -104,7 +104,7 @@ class GenerationTask:
         self.result_queue.append(result)
 
     def get_all_result_queue(self):
-        return sorted(self.result_queue, key=lambda x: x["test_abstract"])
+        return self.result_queue
 
     def length_result_queue(self):
         return len(self.result_queue)
@@ -122,21 +122,21 @@ class GenerationTask:
             os.path.join("/data", self.exclude_dataset), keep_default_na=False
         )
         if "Abstract" in df_excluded.columns:
-            excluded_abstracts = df_excluded["Abstract"].replace("", np.nan).dropna()
+            df_excluded[["true_content"]] = df_excluded[["Abstract"]].replace("", np.nan).dropna()
         else:
-            excluded_abstracts = df_excluded["Content"].replace("", np.nan).dropna()
+            df_excluded[["true_content"]] = df_excluded[["Content"]].replace("", np.nan).dropna()
 
         df_included = pd.read_csv(
             os.path.join("/data", self.include_dataset), keep_default_na=False
         )
         if "Abstract" in df_included.columns:
-            included_abstracts = df_included["Abstract"].replace("", np.nan).dropna()
+            df_included[["true_content"]] = df_included[["Abstract"]].replace("", np.nan).dropna()
         else:
-            included_abstracts = df_included["Content"].replace("", np.nan).dropna()
-        self.excluded_abstracts = excluded_abstracts.sample(
+            df_included[["true_content"]] = df_included[["Content"]].replace("", np.nan).dropna()
+        self.excluded_abstracts = df_excluded.sample(
             frac=1, random_state=1
         )
-        self.included_abstracts = included_abstracts.sample(
+        self.included_abstracts = df_included.sample(
             frac=1, random_state=1
         )
         self.get_next_abstract_excluded = self.get_next_abstract_generator(True)
@@ -145,11 +145,11 @@ class GenerationTask:
     # generator
     def get_next_abstract_generator(self, exclude):
         if exclude:
-            for i,abstract in enumerate(self.excluded_abstracts):
-                yield abstract, "excluded_" + str(i)
+            for i,row in self.excluded_abstracts.iterrows():
+                yield row["true_content"], "excluded_" + str(i), row.get("index_cao", "no_cao_index")
         elif not exclude:
-            for i,abstract in enumerate(self.included_abstracts):
-                yield abstract, "included_" + str(i)
+            for i,row in self.included_abstracts.iterrows():
+                yield row["true_content"], "included_" + str(i), row.get("index_cao", "no_cao_index")
         else:
             raise ValueError(
                 f"Invalid actual_value excluded={exclude}, this should never happen"

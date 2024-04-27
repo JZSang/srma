@@ -1,7 +1,7 @@
 import os
 from pydantic import BaseModel
 import constants
-from modal_references import stub, vol_dataset
+from modal_references import stub, vol_dataset, file_metadata_queue
 
 # Metadata is an object that keeps track of file metadata while in a queue to be processed.
 class Metadata(BaseModel):
@@ -14,7 +14,7 @@ class Metadata(BaseModel):
     original_file: str
     split_type: str
 
-@stub.function(volumes={constants.MOUNT_DIR: vol_dataset})
+@stub.function(volumes={constants.MOUNT_DIR: vol_dataset}, concurrency_limit=1, allow_concurrent_inputs=1000)
 async def dataset_upload_impl(content: bytes, filename: str):
     import pandas as pd
     import numpy as np
@@ -40,7 +40,7 @@ async def dataset_upload_impl(content: bytes, filename: str):
         deleted=False,
         original_file=filename,
     )
-    stub.file_metadata_queue.put(info)
+    file_metadata_queue.put(info)
 
     # 2. Commit
     vol_dataset.commit()

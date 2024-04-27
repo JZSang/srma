@@ -1,13 +1,16 @@
 import modal
 
 ### Raw dataset storage
-vol_dataset = modal.Volume.persisted("srma-dataset")
+vol_dataset = modal.Volume.from_name("srma-dataset")
 
 ### Fewshot GPTCoT storage
-cot_vol = modal.Volume.persisted("srma-cot")
+cot_vol = modal.Volume.from_name("srma-cot")
 
 ### Storage of test results
-vol_save_results = modal.Volume.persisted("srma-results")
+vol_save_results = modal.Volume.from_name("srma-results")
+
+### Storage of intermediate batches
+vol_save_intermediate_batches = modal.Volume.from_name("srma-batches-intermediate")
 
 ### MODAL INITIALIZERS
 stub = modal.Stub(
@@ -21,17 +24,19 @@ stub = modal.Stub(
             "mistralai",
             "mistral-common",
             "fastapi==0.100.0",
+            "pymongo[srv]==3.11"
         ]
     ),
 )
+
 ### Producer-Consumer Queues
-stub.result_queue = modal.Queue.new()
-stub.cot_result_queue = modal.Queue.new()
+result_queue = modal.Queue.from_name("result_queue", create_if_missing=True)
+cot_result_queue = modal.Queue.from_name("cot_result_queue", create_if_missing=True)
 
 ### Process status tracker
-stub.status_tracker = modal.Dict.new()
+status_tracker_global_dictionary = modal.Dict.from_name("status_tracker", create_if_missing=True)
 
-stub.file_lock = modal.Dict.from_name("file_lock", create_if_missing=True)
-stub.file_metadata_queue = modal.Queue.from_name(
+file_lock = modal.Dict.from_name("file_lock", create_if_missing=True)
+file_metadata_queue = modal.Queue.from_name(
     "file_metadata_queue", create_if_missing=True
 )
