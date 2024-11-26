@@ -7,8 +7,8 @@ We aimed to develop generic prompt templates for LLM-driven SR abstract (‘Abst
 ---
 
 ## 📂 BenchSR Data Repository
-Our curated database of systematic review data and prompt templates can be accessed here (currently available as a google drive, to be developed into a website):  
-[**Google Drive Link**](#)  
+Our curated database of systematic review data and prompt templates can be accessed here:  
+[**Link**](#)  
 
 ---
 
