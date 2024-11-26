@@ -6,8 +6,8 @@ We aimed to develop generic prompt templates for LLM-driven SR abstract (‘Abst
 
 ---
 
-## 📂 Data Repository
-Our curated database of systematic review data and associated prompts can be accessed here (currently available as a google drive, to be developed into a website):  
+## 📂 BenchSR Data Repository
+Our curated database of systematic review data and prompt templates can be accessed here (currently available as a google drive, to be developed into a website):  
 [**Google Drive Link**](#)  
 
 ---
@@ -35,7 +35,9 @@ This repository includes:
 
 ## 📝 Citation
 If you use this work in your research, please cite our preprint:
-[**Link to Preprint**](https://www.medrxiv.org/content/10.1101/2024.06.01.24308323v1)  
+
+Cao C, Sang J, Arora R, Kloosterman R, Cecere M, Gorla J, et al. Prompting is all you need: LLMs for systematic review screening. MedRxiv Prepr Serv Health Sci [Internet]. 2024; Available from: https://www.medrxiv.org/content/early/2024/06/03/2024.06.01.24308323
+
 
 
 Uses modal.com to perform backend requests. 
