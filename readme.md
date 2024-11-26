@@ -1,4 +1,4 @@
-# TITLE
+# ScreenPrompt: Universal prompt templates for LLM-driven systematic review screening
 
 
 We aimed to develop generic prompt templates for LLM-driven SR abstract (‘Abstract ScreenPrompt’) and full-text screening (‘ISO-ScreenPrompt’) that could be used by future investigators conducting new SRs. We evaluated the sensitivity and specificity of the prompt templates using BenchSR, our newly created database of published SRs.
