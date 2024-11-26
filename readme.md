@@ -14,7 +14,7 @@ Our curated database of systematic review data and associated prompts can be acc
 
 ## 📄 Manuscript Preprint
 The preprint of our manuscript is available here:  
-[**Link to Preprint**](#https://www.medrxiv.org/content/10.1101/2024.06.01.24308323v1)  
+[**Link to Preprint**](https://www.medrxiv.org/content/10.1101/2024.06.01.24308323v1)  
 
 
 ---
@@ -35,7 +35,7 @@ This repository includes:
 
 ## 📝 Citation
 If you use this work in your research, please cite our preprint:
-[**Link to Preprint**](#https://www.medrxiv.org/content/10.1101/2024.06.01.24308323v1)  
+[**Link to Preprint**](https://www.medrxiv.org/content/10.1101/2024.06.01.24308323v1)  
 
 
 Uses modal.com to perform backend requests. 
