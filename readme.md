@@ -16,7 +16,7 @@ Our curated database of systematic review data and prompt templates can be acces
 
 ## 📄 Manuscript Preprint
 Our article is now published at Annals of Internal Medicine:  
-[**Link to Preprint**](https://annals.org/aim/article/doi/10.7326/ANNALS-24-02189)  
+[**Link to Article**](https://annals.org/aim/article/doi/10.7326/ANNALS-24-02189)  
 
 
 ---
