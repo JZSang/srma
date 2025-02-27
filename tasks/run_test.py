@@ -158,7 +158,7 @@ def finalize_results(results, item: Item, ensemble_threshold) -> FinalizeResults
                 test_abstract=test_abstract,
                 token_counts=token_counts,
                 predicted_values=predicted_values,
-                index_cao=index_cao,
+                index_cao=str(index_cao),
             )
         )
     

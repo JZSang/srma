@@ -24,7 +24,8 @@ stub = modal.Stub(
             "mistralai",
             "mistral-common",
             "fastapi==0.100.0",
-            "pymongo[srv]==3.11"
+            "pymongo[srv]==3.11",
+            "anthropic"
         ]
     ),
 )

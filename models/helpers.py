@@ -3,7 +3,7 @@ from models.messages import generate_messages
 from models.openai import chat_completions_create_params, extract_from_response_openai
 
 def setup_model(model, model_seed):
-    if model == "gemini-pro":
+    if model == "gemini-pro" or model == "gemini-1.5-flash-latest":
         import google.generativeai as genai
         import os
 
@@ -47,6 +47,8 @@ def setup_model(model, model_seed):
         or model == "gpt-4-0125-preview"
         or model == "gpt-3.5-turbo-0125"
         or model == "gpt-4-turbo-2024-04-09"
+        or model == "gpt-4o-2024-05-13"
+        or model == "gpt-4o-2024-08-06"
     ):
         from openai import AsyncOpenAI
 
@@ -85,7 +87,7 @@ def setup_model(model, model_seed):
         raise ValueError("Invalid model setup model")
 
 def calculate_tokens(model, prompt, max_token_response):
-    if model == "gemini-pro":
+    if model == "gemini-pro" or model == "gemini-1.5-flash-latest":
         # gemini doesn't limit by tokens
         return 1
     elif (
@@ -93,6 +95,8 @@ def calculate_tokens(model, prompt, max_token_response):
         or model == "gpt-4-0125-preview"
         or model == "gpt-3.5-turbo-0125"
         or model == "gpt-4-turbo-2024-04-09"
+        or model == "gpt-4o-2024-05-13"
+        or model == "gpt-4o-2024-08-06"
     ):
         import tiktoken
 
@@ -127,5 +131,7 @@ def calculate_tokens(model, prompt, max_token_response):
         num_tokens = len(tokenized.tokens)
         num_tokens += max_token_response
         return num_tokens
+    elif model == "claude-3-5-sonnet-20241022":
+        return 0
     else:
         raise ValueError("Invalid model calculate tokens")

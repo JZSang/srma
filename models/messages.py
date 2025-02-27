@@ -1,11 +1,17 @@
 def generate_messages(model, prompt):
-    if model == "gemini-pro":
+    if model == "gemini-pro" or model == "gemini-1.5-flash-latest":
         return [prompt]
     elif (
         model == "gpt-3.5-turbo"
         or model == "gpt-4-0125-preview"
         or model == "gpt-3.5-turbo-0125"
         or model == "gpt-4-turbo-2024-04-09"
+        or model == "gpt-4o-2024-05-13"
+        or model == "gpt-4o-2024-08-06"
+    ):
+        return [{"role": "user", "content": prompt}]
+    elif (
+        model == "claude-3-5-sonnet-20241022"
     ):
         return [{"role": "user", "content": prompt}]
     elif model == "open-mixtral-8x22b-2404" or model == "mistral-large-2402":

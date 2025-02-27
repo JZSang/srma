@@ -14,13 +14,26 @@ USAGE_LIMITS = {
         "max_requests_per_minute": 10000,
         "max_tokens_per_minute": 1500000,
     },
+    "gpt-4o-2024-05-13": {
+        "max_requests_per_minute": 10000,
+        "max_tokens_per_minute": 1500000,
+    },
+    "gpt-4o-2024-08-06": {
+        "max_requests_per_minute": 10000,
+        "max_tokens_per_minute": 1500000,
+    },
     "gpt-3.5-turbo-0125": {
         "max_requests_per_minute": 10000,
         "max_tokens_per_minute": 2000000,
     },
     "gemini-pro": {
-        "max_requests_per_minute": 60,
+        "max_requests_per_minute": 360,
         "max_tokens_per_minute": float("inf"),
+    },
+    "gemini-1.5-flash-latest": {
+        "max_requests_per_minute": 15,
+        "max_tokens_per_minute": 1000000,
+        "max_requests_per_second": 2
     },
     "open-mixtral-8x22b-2404": {
         "max_requests_per_minute": 300,

@@ -20,7 +20,7 @@ class Tokenizer(BaseModel):
 def calculate_tokens(params: Tokenizer):
     model = params.model
     
-    if model == "gemini-pro":
+    if model == "gemini-pro" or model == "gemini-1.5-flash-latest":
         # gemini doesn't limit by tokens
         return {**params.result}
     elif (

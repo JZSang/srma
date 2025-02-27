@@ -24,6 +24,7 @@ from modal_references import (
 from datasets.upload import dataset_upload_impl
 from datasets.manage import dataset_manage_wrapper, DatasetManage
 from models.helpers import setup_model, calculate_tokens
+from models.messages import generate_messages
 from models.openai import chat_completions_create_params
 from operations.kill import kill_impl, KillException
 from operations.status import get_status_impl
@@ -170,6 +171,7 @@ def check_test(function_id=None):
     secrets=[
         modal.Secret.from_name("mongo-db-atlas-srma"),
         modal.Secret.from_name("srma-openai"),
+        modal.Secret.from_name("anthropic-secret"),
     ],
     volumes={MOUNT_DIR: vol_save_intermediate_batches},
 )
@@ -244,10 +246,24 @@ async def run_f(item: Item):
 
     ### Batch processing
     if item.is_batch:
+        
+        # if item.model == "claude-3-5-sonnet-20241022":
+        #     import anthropic
+        #     from anthropic.types.beta.messages.beta_message_batch import BetaMessageBatch
+        #     client = anthropic.Anthropic()
+        #     batches: list[BetaMessageBatch] = []
+        #     for generation_task in generation_tasks:
+        #         generation_task_results = generation_task.get_all_result_queue()
+        #         message_batch = client.beta.messages.batches.create(
+        #             requests=list(map(lambda x: x["line"], generation_task_results))
+        #         )
+        #         batches.append(message_batch)
+        # else: 
         from pathlib import Path
         import tempfile
 
         files: list[Path] = []
+        anthropic_generation_tasks: list[BetaMessageBatch] = []
         number_of_workloads = 0
         for generation_task in generation_tasks:
             generation_task_results = generation_task.get_all_result_queue()
@@ -256,9 +272,11 @@ async def run_f(item: Item):
                 delete=False, suffix=".jsonl", prefix="generation_task_"
             ) as tmp:
                 import json
-
-                jsonl = "\n".join([json.dumps(result["line"]) for result in generation_task_results])
-                tmp.write(jsonl.encode())
+                if item.model == "claude-3-5-sonnet-20241022":
+                    anthropic_generation_tasks = [result["line"] for result in generation_task_results]
+                else:
+                    jsonl = "\n".join([json.dumps(result["line"]) for result in generation_task_results])
+                    tmp.write(jsonl.encode())
                 files.append([
                     Path(tmp.name), 
                     list(map(lambda x: x["return"], generation_task_results))
@@ -269,20 +287,30 @@ async def run_f(item: Item):
         from openai import AsyncOpenAI
         import asyncio
         import json
+        import anthropic
+        from anthropic.types.beta.messages.beta_message_batch import BetaMessageBatch
+        
 
-        client = AsyncOpenAI()
+        async def batch_and_save_file(file: Path, results: list[dict], model: str):
 
-        async def batch_and_save_file(file: Path, results: list[dict]):
-
-            response = await client.files.create(file=file, purpose="batch")
-            input_file_id = response.id
-            batch = await client.batches.create(
-                input_file_id=input_file_id,
-                endpoint="/v1/chat/completions",
-                completion_window="24h",
-                metadata={"ensemble_id": special_id},
-            )
-            batch_id = batch.id
+            if model == "claude-3-5-sonnet-20241022":
+                client = anthropic.Anthropic()
+                batch = client.beta.messages.batches.create(
+                    requests=anthropic_generation_tasks
+                )
+                batch_id = batch.id
+                input_file_id = "(anthropic does not take a file id)"
+            else:
+                client = AsyncOpenAI()
+                response = await client.files.create(file=file, purpose="batch")
+                input_file_id = response.id
+                batch = await client.batches.create(
+                    input_file_id=input_file_id,
+                    endpoint="/v1/chat/completions",
+                    completion_window="24h",
+                    metadata={"ensemble_id": special_id},
+                )
+                batch_id = batch.id
             
             # Save the intermediate instantiations of AbstractBatch
             with open(f"{MOUNT_DIR}/intermediate_{batch_id}.json", "w") as f:
@@ -291,25 +319,40 @@ async def run_f(item: Item):
             print(f"Created batch for file {input_file_id} with batch id {batch_id}. Also saved intermediate results for collation upon completion.")
             return batch
 
-        batches = await asyncio.gather(*[batch_and_save_file(file[0], file[1]) for file in files])
+        batches = await asyncio.gather(*[batch_and_save_file(file[0], file[1], item.model) for file in files])
+
         individual_collection = mongo_client.get_database("SRMA").get_collection(
             "individual_batch_status"
         )
         individual_collection.insert_many([batch.to_dict() for batch in batches])
-        print(f"""Added the OpenAI batches {", ".join(map(lambda x: x.id, batches))}""")
+        print(f"""Added the batches {", ".join(map(lambda x: x.id, batches))}""")
 
         collection = mongo_client.get_database("SRMA").get_collection("run_batched")
-        collection.insert_one(
-            {
-                "ensemble_id": special_id,
-                "batches": [batch.id for batch in batches],
-                "created_at": int(time.time()),
-                "status": batches[0].status,
-                "item": item.__dict__,
-                "ensemble_threshold": ensemble_threshold,
-                "data_file_name": None
-            }
-        )
+        
+        if item.model == "claude-3-5-sonnet-20241022":
+            collection.insert_one(
+                {
+                    "ensemble_id": special_id,
+                    "batches": [batch.id for batch in batches],
+                    "created_at": int(time.time()),
+                    "status": batches[0].processing_status,
+                    "item": item.__dict__,
+                    "ensemble_threshold": ensemble_threshold,
+                    "data_file_name": None
+                }
+            )
+        else:
+            collection.insert_one(
+                {
+                    "ensemble_id": special_id,
+                    "batches": [batch.id for batch in batches],
+                    "created_at": int(time.time()),
+                    "status": batches[0].status,
+                    "item": item.__dict__,
+                    "ensemble_threshold": ensemble_threshold,
+                    "data_file_name": None
+                }
+            )
         
         vol_save_intermediate_batches.commit()
         return True
@@ -468,6 +511,7 @@ async def gptcot(item: COTItem):
     secrets=[
         modal.Secret.from_name("srma-openai"),
         modal.Secret.from_name("srma-gemini"),
+        modal.Secret.from_name("anthropic-secret"),
     ],
     memory=2048,
     cpu=2.0,
@@ -525,7 +569,7 @@ async def gen(
     status_tracker = StatusTracker(generation_task.mode)
     # it seems like gemini-pro has a rate limit that updates every half minute
     seconds_to_pause_after_rate_limit_error = (
-        30 if generation_task.model == "gemini-pro" else 15
+        30 if generation_task.model == "gemini-pro" or generation_task.model == "gemini-1.5-flash-latest" else 15
     )
 
     # initialize available capacity counts
@@ -883,20 +927,36 @@ class AbstractBatch(Abstract):
             "gpt-3.5-turbo",
             "gpt-4-0125-preview",
             "gpt-4-turbo-2024-04-09",
+            "gpt-4o-2024-05-13",
+            "gpt-4o-2024-08-06",
             "gpt-3.5-turbo-0125",
+            "claude-3-5-sonnet-20241022"
         ]:
             raise ValueError("Invalid model for batch processing")
-
-        line = {
-            "custom_id": self.abstract_id,
-            "method": "POST",
-            "url": "/v1/chat/completions",
-            "body": chat_completions_create_params(
-                self.generation_task.model,
-                self.final_prompt,
-                self.generation_task.model_seed,
-            ),
-        }
+        
+        from anthropic.types.beta.message_create_params import MessageCreateParamsNonStreaming
+        from anthropic.types.beta.messages.batch_create_params import Request
+        
+        if self.generation_task.model == "claude-3-5-sonnet-20241022":
+            line = Request(
+                custom_id=self.abstract_id,
+                params=MessageCreateParamsNonStreaming(
+                    model="claude-3-5-sonnet-20241022",
+                    max_tokens=1024,
+                    messages=generate_messages(self.generation_task.model, self.final_prompt)
+                )
+            )
+        else:
+            line = {
+                "custom_id": self.abstract_id,
+                "method": "POST",
+                "url": "/v1/chat/completions",
+                "body": chat_completions_create_params(
+                    self.generation_task.model,
+                    self.final_prompt,
+                    self.generation_task.model_seed,
+                ),
+            }
 
         self.generation_task.put_result_queue(
             {"line": line, "return": self.get_metadata().__dict__}
