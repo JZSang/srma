@@ -6,7 +6,7 @@ We aimed to develop generic prompt templates for LLM-driven SR abstract (‘Abst
 We found that LLMs have excellent performance in abstract (weighted sensitivity 97.7% [range, 86.7% to 100%], specificity 85.2% [68.3% to 95.9%] and full-text screening (weighted sensitivity 96.5% [89.7% to 100.0%], (91.2% [range, 80.7% to 100%]), rivaling that of human reviewers. 
 
 
-## Interested in automated screening or contributing? 
+## Interested in automated screening or contributing to BenchSR? 
 Get in touch!
 [**Link to Interest Form**](https://docs.google.com/forms/d/e/1FAIpQLSfEkgY7gUtVW3nwBeP1anPUuSKH58oEidmr5KSG56F5E23oRA/viewform?usp=dialog)  
 
