@@ -8,13 +8,13 @@ We found that LLMs have excellent performance in abstract (weighted sensitivity 
 
 ## Interested in automated screening or contributing? 
 Get in touch!
-[**Link to Interest Form**](#https://docs.google.com/forms/d/e/1FAIpQLSfEkgY7gUtVW3nwBeP1anPUuSKH58oEidmr5KSG56F5E23oRA/viewform?usp=dialog)  
+[**Link to Interest Form**](https://docs.google.com/forms/d/e/1FAIpQLSfEkgY7gUtVW3nwBeP1anPUuSKH58oEidmr5KSG56F5E23oRA/viewform?usp=dialog)  
 
 ---
 
 ## 📂 BenchSR Data Repository - UNDER DEVELOPMENT
 Our curated database of systematic review data and prompt templates can be accessed here:  
-[**Link to BenchSR**](#https://docs.google.com/forms/d/e/1FAIpQLSfEkgY7gUtVW3nwBeP1anPUuSKH58oEidmr5KSG56F5E23oRA/viewform?usp=dialog)  
+[**Link to BenchSR**](https://docs.google.com/forms/d/e/1FAIpQLSfEkgY7gUtVW3nwBeP1anPUuSKH58oEidmr5KSG56F5E23oRA/viewform?usp=dialog)  
 
 ---
 
