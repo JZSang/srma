@@ -83,7 +83,7 @@ class OpenAIBatchManagement(BatchManagement):
         return max(map(lambda x: x.completed_at, batches))
     
     async def download_batch_results(self, batches: list[Batch]) -> list[list[any]]:
-        files = await asyncio.gather(*[self.client.files.content(batch.output_file_id) for batch in batches])
+        files = await asyncio.gather(*[self.client.files.content(batch.output_file_id) for batch in batches if batch.output_file_id])
         files = list(map(lambda x: [json.loads(line) for line in x.iter_lines()], files))
         return files
     
@@ -123,7 +123,7 @@ class AnthropicBatchManagement(BatchManagement):
         return max(map(lambda x: int(x.ended_at.timestamp()), batches))
     
     async def download_batch_results(self, batches: list[BetaMessageBatch]) -> list[list[any]]:
-        files = [[line.to_dict() for line in self.client.beta.messages.batches.results(batch.id)] for batch in batches]
+        files = [[line.to_dict(mode="json") for line in self.client.beta.messages.batches.results(batch.id)] for batch in batches]
         return files
     
     def get_error_from_line(self, line: dict) -> str | None:
@@ -132,8 +132,13 @@ class AnthropicBatchManagement(BatchManagement):
         return None
 
     def extract_from_response(self, response):
-        return response["result"]["message"]["content"][0]["text"]
-        
+        for content_block in response["result"]["message"]["content"]:
+            if "type" in content_block:
+                if content_block["type"] == "text" and "text" in content_block:
+                    return content_block["text"]
+            elif "text" in content_block:
+                return content_block["text"]
+            
 
 @stub.function(secrets=[modal.Secret.from_name("mongo-db-atlas-srma"), modal.Secret.from_name("srma-openai"), modal.Secret.from_name("anthropic-secret")], volumes={MOUNT_DIR: vol_save_intermediate_batches},)
 async def check_and_update_batches_impl(_: CheckAndUpdateBatches):

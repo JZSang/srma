@@ -1,46 +1,55 @@
 # Modal
+import asyncio
 import dataclasses
-import modal
 
 # System
 import time
-import asyncio
-from typing import Literal, Union
 from dataclasses import dataclass, field
+from typing import Literal, Union
+
+import modal
+from fastapi import File, UploadFile
 
 # Typing
 from pydantic import BaseModel
-from fastapi import UploadFile, File
 
-# Source
-from modal_references import (
-    vol_dataset,
-    cot_vol,
-    stub,
-    status_tracker_global_dictionary,
-    vol_save_intermediate_batches,
-    vol_save_results
-)
-from datasets.upload import dataset_upload_impl
-from datasets.manage import dataset_manage_wrapper, DatasetManage
-from models.helpers import setup_model, calculate_tokens
-from models.messages import generate_messages
-from models.openai import chat_completions_create_params
-from operations.kill import kill_impl, KillException
-from operations.status import get_status_impl
-from tasks.abstract_resource import AbstractRunResource
-from tasks.batch import CheckAndUpdateBatches, LoadBatch, LoadBatches, check_and_update_batches_impl, load_batch, load_batches
-from tasks.evaluation import is_excluded
-from tasks.files import save_final_results
-from tasks.generation_task import GenerationTask
 from constants import (
     DEFAULT_SECONDS_PER_REQUEST,
+    MAX_COMPLETION_TOKENS,
     MOUNT_DIR,
     MOUNT_DIR_COT,
-    MAX_COMPLETION_TOKENS,
     SAVE_BATCH_MOUNT_DIR,
     USAGE_LIMITS,
 )
+from datasets.manage import DatasetManage, dataset_manage_wrapper
+from datasets.upload import dataset_upload_impl
+
+# Source
+from modal_references import (
+    cot_vol,
+    status_tracker_global_dictionary,
+    stub,
+    vol_dataset,
+    vol_save_intermediate_batches,
+    vol_save_results,
+)
+from models.helpers import calculate_tokens, setup_model
+from models.messages import generate_messages
+from models.openai import chat_completions_create_params
+from operations.kill import KillException, kill_impl
+from operations.status import get_status_impl
+from tasks.abstract_resource import AbstractRunResource
+from tasks.batch import (
+    CheckAndUpdateBatches,
+    LoadBatch,
+    LoadBatches,
+    check_and_update_batches_impl,
+    load_batch,
+    load_batches,
+)
+from tasks.evaluation import is_excluded
+from tasks.files import save_final_results
+from tasks.generation_task import GenerationTask
 from tasks.run_test import Item, finalize_results
 from utils.id import generate_unique_id
 
@@ -60,7 +69,14 @@ async def router_upload(operation: UploadOperations, file: UploadFile = File(...
         raise ValueError("Invalid operation")
 
 
-Operations = Literal["dataset_manage", "status", "kill", "load_batches", "check_and_update_batches", "load_batch"]
+Operations = Literal[
+    "dataset_manage",
+    "status",
+    "kill",
+    "load_batches",
+    "check_and_update_batches",
+    "load_batch",
+]
 
 
 class Routing(BaseModel):
@@ -115,9 +131,7 @@ def kill(mode):
 def check_and_update_batches(params: CheckAndUpdateBatches):
     call = check_and_update_batches_impl.spawn(params)
     function_id = call.object_id
-    return {
-        "function_id": function_id
-    }
+    return {"function_id": function_id}
 
 
 class COTItem(BaseModel):
@@ -131,6 +145,7 @@ class COTItem(BaseModel):
     exclude_dataset: str
 
     seed: int = 1
+
 
 class COTResult(BaseModel):
     prompt: str
@@ -166,6 +181,7 @@ def check_test(function_id=None):
     except:
         raise ValueError("Invalid state")
 
+
 @stub.function(
     timeout=60 * 60,
     secrets=[
@@ -180,8 +196,9 @@ async def run_f(item: Item):
 
     if item.is_batch:
         # prewarm db
-        from pymongo.mongo_client import MongoClient
         import os
+
+        from pymongo.mongo_client import MongoClient
 
         uri = (
             "mongodb+srv://dotsangjason:"
@@ -246,7 +263,7 @@ async def run_f(item: Item):
 
     ### Batch processing
     if item.is_batch:
-        
+
         # if item.model == "claude-3-5-sonnet-20241022":
         #     import anthropic
         #     from anthropic.types.beta.messages.beta_message_batch import BetaMessageBatch
@@ -258,9 +275,9 @@ async def run_f(item: Item):
         #             requests=list(map(lambda x: x["line"], generation_task_results))
         #         )
         #         batches.append(message_batch)
-        # else: 
-        from pathlib import Path
+        # else:
         import tempfile
+        from pathlib import Path
 
         files: list[Path] = []
         anthropic_generation_tasks: list[BetaMessageBatch] = []
@@ -272,28 +289,41 @@ async def run_f(item: Item):
                 delete=False, suffix=".jsonl", prefix="generation_task_"
             ) as tmp:
                 import json
-                if item.model == "claude-3-5-sonnet-20241022":
-                    anthropic_generation_tasks = [result["line"] for result in generation_task_results]
+
+                if item.model in [
+                    "claude-3-5-sonnet-20241022",
+                    "claude-3-7-sonnet-20250219",
+                ]:
+                    anthropic_generation_tasks = [
+                        result["line"] for result in generation_task_results
+                    ]
                 else:
-                    jsonl = "\n".join([json.dumps(result["line"]) for result in generation_task_results])
+                    jsonl = "\n".join(
+                        [
+                            json.dumps(result["line"])
+                            for result in generation_task_results
+                        ]
+                    )
                     tmp.write(jsonl.encode())
-                files.append([
-                    Path(tmp.name), 
-                    list(map(lambda x: x["return"], generation_task_results))
-                ])
+                files.append(
+                    [
+                        Path(tmp.name),
+                        list(map(lambda x: x["return"], generation_task_results)),
+                    ]
+                )
 
         print("Batched files to upload:", list(map(lambda x: x[0], files)))
         print("Total number of workloads: ", number_of_workloads)
-        from openai import AsyncOpenAI
         import asyncio
         import json
+
         import anthropic
         from anthropic.types.beta.messages.beta_message_batch import BetaMessageBatch
-        
+        from openai import AsyncOpenAI
 
         async def batch_and_save_file(file: Path, results: list[dict], model: str):
 
-            if model == "claude-3-5-sonnet-20241022":
+            if model in ["claude-3-5-sonnet-20241022", "claude-3-7-sonnet-20250219"]:
                 client = anthropic.Anthropic()
                 batch = client.beta.messages.batches.create(
                     requests=anthropic_generation_tasks
@@ -311,15 +341,19 @@ async def run_f(item: Item):
                     metadata={"ensemble_id": special_id},
                 )
                 batch_id = batch.id
-            
+
             # Save the intermediate instantiations of AbstractBatch
             with open(f"{MOUNT_DIR}/intermediate_{batch_id}.json", "w") as f:
                 json.dump(results, f)
-            
-            print(f"Created batch for file {input_file_id} with batch id {batch_id}. Also saved intermediate results for collation upon completion.")
+
+            print(
+                f"Created batch for file {input_file_id} with batch id {batch_id}. Also saved intermediate results for collation upon completion."
+            )
             return batch
 
-        batches = await asyncio.gather(*[batch_and_save_file(file[0], file[1], item.model) for file in files])
+        batches = await asyncio.gather(
+            *[batch_and_save_file(file[0], file[1], item.model) for file in files]
+        )
 
         individual_collection = mongo_client.get_database("SRMA").get_collection(
             "individual_batch_status"
@@ -328,8 +362,8 @@ async def run_f(item: Item):
         print(f"""Added the batches {", ".join(map(lambda x: x.id, batches))}""")
 
         collection = mongo_client.get_database("SRMA").get_collection("run_batched")
-        
-        if item.model == "claude-3-5-sonnet-20241022":
+
+        if item.model in ["claude-3-5-sonnet-20241022", "claude-3-7-sonnet-20250219"]:
             collection.insert_one(
                 {
                     "ensemble_id": special_id,
@@ -338,7 +372,7 @@ async def run_f(item: Item):
                     "status": batches[0].processing_status,
                     "item": item.__dict__,
                     "ensemble_threshold": ensemble_threshold,
-                    "data_file_name": None
+                    "data_file_name": None,
                 }
             )
         else:
@@ -350,10 +384,10 @@ async def run_f(item: Item):
                     "status": batches[0].status,
                     "item": item.__dict__,
                     "ensemble_threshold": ensemble_threshold,
-                    "data_file_name": None
+                    "data_file_name": None,
                 }
             )
-        
+
         vol_save_intermediate_batches.commit()
         return True
 
@@ -365,7 +399,7 @@ async def run_f(item: Item):
             for result_raw in generation_task.get_all_result_queue()
         ],
         item,
-        ensemble_threshold
+        ensemble_threshold,
     )
 
     status_tracker: StatusTracker = status_tracker_global_dictionary[mode]
@@ -378,7 +412,6 @@ async def run_f(item: Item):
     ret = {
         # Overlay inputs
         **item.model_dump(),
-        
         # Overlay finalized results (may overwrite some things in item, that's ok)
         **dataclasses.asdict(finalized_results),
         "status_tracker": status_tracker.__dict__,
@@ -569,7 +602,10 @@ async def gen(
     status_tracker = StatusTracker(generation_task.mode)
     # it seems like gemini-pro has a rate limit that updates every half minute
     seconds_to_pause_after_rate_limit_error = (
-        30 if generation_task.model == "gemini-pro" or generation_task.model == "gemini-1.5-flash-latest" else 15
+        30
+        if generation_task.model == "gemini-pro"
+        or generation_task.model == "gemini-1.5-flash-latest"
+        else 15
     )
 
     # initialize available capacity counts
@@ -862,6 +898,7 @@ class AbstractSync(Abstract):
             self.generation_task.model, self.generation_task.model_seed
         )
         import asyncio
+
         try:
 
             # Model produces response
@@ -908,7 +945,7 @@ class AbstractSync(Abstract):
                 error=None,
             )
             return resource
-        
+
         resource.finalize(
             skipped=True,
             correct=False,
@@ -918,6 +955,7 @@ class AbstractSync(Abstract):
         )
 
         return resource
+
 
 @dataclass(kw_only=True)
 class AbstractBatch(Abstract):
@@ -929,22 +967,34 @@ class AbstractBatch(Abstract):
             "gpt-4-turbo-2024-04-09",
             "gpt-4o-2024-05-13",
             "gpt-4o-2024-08-06",
+            "gpt-4o-2024-11-20",
+            "o3-mini-2025-01-31",
+            "o1-2024-12-17",
             "gpt-3.5-turbo-0125",
-            "claude-3-5-sonnet-20241022"
+            "claude-3-5-sonnet-20241022",
+            "claude-3-7-sonnet-20250219",
         ]:
             raise ValueError("Invalid model for batch processing")
-        
-        from anthropic.types.beta.message_create_params import MessageCreateParamsNonStreaming
+
+        from anthropic.types.beta.message_create_params import (
+            MessageCreateParamsNonStreaming,
+        )
         from anthropic.types.beta.messages.batch_create_params import Request
-        
-        if self.generation_task.model == "claude-3-5-sonnet-20241022":
+
+        if self.generation_task.model in [
+            "claude-3-5-sonnet-20241022",
+            "claude-3-7-sonnet-20250219",
+        ]:
             line = Request(
                 custom_id=self.abstract_id,
                 params=MessageCreateParamsNonStreaming(
-                    model="claude-3-5-sonnet-20241022",
-                    max_tokens=1024,
-                    messages=generate_messages(self.generation_task.model, self.final_prompt)
-                )
+                    model=self.generation_task.model,
+                    max_tokens=60000,
+                    messages=generate_messages(
+                        self.generation_task.model, self.final_prompt
+                    ),
+                    thinking={"budget_tokens": 32000, "type": "enabled"},
+                ),
             )
         else:
             line = {
@@ -972,6 +1022,7 @@ def task_id_generator_function():
     while True:
         yield task_id
         task_id += 1
+
 
 @stub.local_entrypoint()
 def main():

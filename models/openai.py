@@ -3,13 +3,19 @@ from openai.types.chat import CompletionCreateParams
 from models.messages import generate_messages
 
 
-def chat_completions_create_params(model: str, prompt: str, model_seed: int) -> CompletionCreateParams:
+
+
+def chat_completions_create_params(
+    model: str, prompt: str, model_seed: int
+) -> CompletionCreateParams:
     return {
         "messages": generate_messages(model, prompt),
         "model": model,
-        "max_tokens": MAX_COMPLETION_TOKENS,
+        "max_completion_tokens": MAX_COMPLETION_TOKENS,
         "seed": model_seed,
+        "reasoning_effort": "high",
     }
+
 
 def extract_from_response_openai(response, is_json=False):
     if is_json:

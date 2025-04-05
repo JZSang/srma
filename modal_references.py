@@ -19,13 +19,13 @@ stub = modal.Stub(
         [
             "google-generativeai",
             "pandas",
-            "openai==1.23.2",
+            "openai==1.64.0",
             "tiktoken",
             "mistralai",
             "mistral-common",
             "fastapi==0.100.0",
             "pymongo[srv]==3.11",
-            "anthropic"
+            "anthropic==0.47.2"
         ]
     ),
 )

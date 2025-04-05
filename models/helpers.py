@@ -2,10 +2,12 @@ from constants import MAX_COMPLETION_TOKENS, TOKENIZER
 from models.messages import generate_messages
 from models.openai import chat_completions_create_params, extract_from_response_openai
 
+
 def setup_model(model, model_seed):
     if model == "gemini-pro" or model == "gemini-1.5-flash-latest":
-        import google.generativeai as genai
         import os
+
+        import google.generativeai as genai
 
         genai.configure(api_key=os.environ["SERVICE_ACCOUNT_JSON"])
         # Set up the model
@@ -49,17 +51,20 @@ def setup_model(model, model_seed):
         or model == "gpt-4-turbo-2024-04-09"
         or model == "gpt-4o-2024-05-13"
         or model == "gpt-4o-2024-08-06"
+        or model == "gpt-4o-2024-11-20"
+        or model == "o1-2024-12-17"
+        or model == "o3-mini-2025-01-31"
     ):
         from openai import AsyncOpenAI
 
         client = AsyncOpenAI()
 
         async def returned_model(prompt):
-            return (
-                extract_from_response_openai(
-                    await client.chat.completions.create(**chat_completions_create_params(model, prompt, model_seed)),
-                    is_json=False
-                )
+            return extract_from_response_openai(
+                await client.chat.completions.create(
+                    **chat_completions_create_params(model, prompt, model_seed)
+                ),
+                is_json=False,
             )
 
         return returned_model
@@ -86,6 +91,7 @@ def setup_model(model, model_seed):
     else:
         raise ValueError("Invalid model setup model")
 
+
 def calculate_tokens(model, prompt, max_token_response):
     if model == "gemini-pro" or model == "gemini-1.5-flash-latest":
         # gemini doesn't limit by tokens
@@ -97,6 +103,9 @@ def calculate_tokens(model, prompt, max_token_response):
         or model == "gpt-4-turbo-2024-04-09"
         or model == "gpt-4o-2024-05-13"
         or model == "gpt-4o-2024-08-06"
+        or model == "gpt-4o-2024-11-20"
+        or model == "o1-2024-12-17"
+        or model == "o3-mini-2025-01-31"
     ):
         import tiktoken
 
@@ -114,11 +123,9 @@ def calculate_tokens(model, prompt, max_token_response):
         num_tokens += max_token_response
         return num_tokens
     elif model == "open-mixtral-8x22b-2404" or model == "mistral-large-2402":
-        from mistral_common.protocol.instruct.messages import (
-            UserMessage,
-        )
-        from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
+        from mistral_common.protocol.instruct.messages import UserMessage
         from mistral_common.tokens.instruct.normalize import ChatCompletionRequest
+        from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 
         tokenizer_v3 = MistralTokenizer.v3()
 
@@ -131,7 +138,7 @@ def calculate_tokens(model, prompt, max_token_response):
         num_tokens = len(tokenized.tokens)
         num_tokens += max_token_response
         return num_tokens
-    elif model == "claude-3-5-sonnet-20241022":
+    elif model in ["claude-3-5-sonnet-20241022", "claude-3-7-sonnet-20250219"]:
         return 0
     else:
         raise ValueError("Invalid model calculate tokens")
